@@ -39,28 +39,43 @@ def train_epoch(model, train_loader, optimizer, device, epoch, total_steps, step
         tau = model.get_ema_decay(step, total_steps)
         model._update_target_encoder(tau=tau)
 
+        # Log tau every 10 steps
+        if batch_idx % 10 == 0:
+            print(f"  step={step} | tau={tau:.6f} | loss={loss.item():.6f}")
+
         total_loss += loss.item()
         num_batches += 1
-        pbar.set_postfix({'loss': loss.item()})
+        pbar.set_postfix({'loss': loss.item(), 'tau': f'{tau:.4f}'})
 
     return total_loss / num_batches
 
 
-def validate(model, val_loader, device):
+def validate(model, val_loader, device, debug=True):
     """Validate model."""
     model.eval()
     total_loss = 0.0
     num_batches = 0
     
     with torch.no_grad():
-        for batch in val_loader:
+        for batch_idx, batch in enumerate(val_loader):
             mcc = batch['mcc'].to(device)
             amount = batch['amount'].to(device)
             
-            loss, _ = model(mcc, amount)
+            loss, sx = model(mcc, amount)
             
             total_loss += loss.item()
             num_batches += 1
+
+            if debug and batch_idx == 0:
+                # Probe target encoder directly
+                sy = model.target_encoder(mcc, amount)  # (batch, seq_len, d_model)
+                
+                print(f"\n  [Debug - first val batch]")
+                print(f"  Target encoder output norm:   {sy.norm(dim=-1).mean():.4f}")
+                print(f"  Context encoder output norm:  {sx.norm(dim=-1).mean():.4f}")
+                print(f"  Target std across batch:      {sy.std(dim=0).mean():.6f}")
+                print(f"  Target mean across batch:     {sy.mean():.6f}")
+                print(f"  Loss this batch:              {loss.item():.6f}")
     
     avg_loss = total_loss / num_batches
     return avg_loss

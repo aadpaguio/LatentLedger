@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional, List
+from math import cos, pi
 
 # Safe default for positional embedding; sequences longer than this are clamped.
 MAX_SEQ_LEN = 512
@@ -219,8 +220,11 @@ class JEPA(nn.Module):
             param.requires_grad = False
 
     def get_ema_decay(self, step: int, total_steps: int) -> float:
-        """Linearly anneal EMA momentum from 0.996 to 1.0 over training (Appendix A.1 'Optimization')."""
-        return 0.996 + (1.0 - 0.996) * (step / max(1, total_steps))
+        """Cosine annealing from 0.90 → 0.999 over training."""
+        tau_start = 0.90
+        tau_end = 0.999
+        cosine = (1 - cos(pi * step / max(1, total_steps))) / 2  # 0→1
+        return tau_start + (tau_end - tau_start) * cosine
 
     def _update_target_encoder(self, tau: float):
         """
