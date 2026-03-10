@@ -6,7 +6,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional, List
-from math import cos, pi
 
 # Safe default for positional embedding; sequences longer than this are clamped.
 MAX_SEQ_LEN = 512
@@ -35,6 +34,7 @@ class TransactionEncoder(nn.Module):
 
         # Project [mcc_emb (mcc_emb_dim) + amount (1)] to d_model
         self.input_proj = nn.Linear(mcc_emb_dim + 1, d_model)
+        self.input_norm = nn.LayerNorm(d_model)
 
         # Learned positional encodings
         self.pos_embedding = nn.Embedding(MAX_SEQ_LEN, d_model)
@@ -75,7 +75,7 @@ class TransactionEncoder(nn.Module):
 
         # Concatenate and project to d_model
         combined = torch.cat([mcc_emb, amount_norm], dim=-1)  # (batch, seq_len, mcc_emb_dim + 1)
-        x = self.input_proj(combined)  # (batch, seq_len, d_model)
+        x = self.input_norm(self.input_proj(combined))  # (batch, seq_len, d_model)
 
         # Positional encoding: use provided indices (e.g. context positions) or 0..seq_len-1
         if position_ids is not None:
@@ -220,11 +220,7 @@ class JEPA(nn.Module):
             param.requires_grad = False
 
     def get_ema_decay(self, step: int, total_steps: int) -> float:
-        """Cosine annealing from 0.90 → 0.999 over training."""
-        tau_start = 0.90
-        tau_end = 0.999
-        cosine = (1 - cos(pi * step / max(1, total_steps))) / 2  # 0→1
-        return tau_start + (tau_end - tau_start) * cosine
+      return 0.996 + (1.0 - 0.996) * (step / max(1, total_steps))
 
     def _update_target_encoder(self, tau: float):
         """
@@ -243,52 +239,80 @@ class JEPA(nn.Module):
         self, batch_size: int, seq_len: int, device: torch.device
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
-        I-JEPA multi-block masking (Section 3, Appendix A.1).
-        Same mask shapes for all batch items for efficiency.
+        I-JEPA multi-block masking — positions sampled independently per sample.
+
+        Block *lengths* are shared across the batch (same scale drawn once) so tensors
+        stay rectangular and need no padding. Block *start positions* are drawn
+        independently for every sample in the batch.
 
         Returns:
-            context_indices: (batch_size, num_context_positions)
-            target_blocks: list of M tensors, each (batch_size, block_len_i)
+            context_indices : (batch_size, num_context_positions)
+            target_blocks   : list of M tensors, each (batch_size, block_len_i)
         """
         M = NUM_TARGET_BLOCKS
-        # Target blocks: each scale in (0.15, 0.2) of seq_len
-        block_lens = []
-        for _ in range(M):
-            L = random.uniform(0.15 * seq_len, 0.2 * seq_len)
-            block_lens.append(max(1, int(L)))
-        starts = [
-            random.randint(0, max(0, seq_len - block_lens[i]))
-            for i in range(M)
+
+        # ── 1. Target blocks ──────────────────────────────────────────────────────
+        # Draw block lengths once (shared scale → uniform tensor shapes).
+        block_lens = [
+            max(1, int(random.uniform(0.15 * seq_len, 0.2 * seq_len)))
+            for _ in range(M)
         ]
 
         target_blocks: List[torch.Tensor] = []
-        for i in range(M):
-            indices = torch.arange(
-                starts[i], starts[i] + block_lens[i], device=device, dtype=torch.long
-            )
-            target_blocks.append(indices.unsqueeze(0).expand(batch_size, -1))
+        # Boolean occupancy mask: True where ANY target block covers each position.
+        target_mask = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=device)
 
-        # Context block: scale in (0.85, 1.0), then remove overlap with target blocks
-        context_len = int(random.uniform(0.85 * seq_len, 1.0 * seq_len))
-        context_len = min(context_len, seq_len)
-        context_start = random.randint(0, max(0, seq_len - context_len))
-        context_candidates = torch.arange(
-            context_start, context_start + context_len, device=device, dtype=torch.long
-        )
-        context_candidates = context_candidates[context_candidates < seq_len]
-
-        all_target = set()
         for i in range(M):
-            for j in range(target_blocks[i].size(1)):
-                all_target.add(target_blocks[i][0, j].item())
-        context_list = [c for c in context_candidates.tolist() if c not in all_target]
-        if not context_list:
-            all_positions = set(range(seq_len))
-            context_list = list(all_positions - all_target)
-        if not context_list:
-            context_list = [0]  # fallback single position
-        context_indices = torch.tensor(context_list, device=device, dtype=torch.long)
-        context_indices = context_indices.unsqueeze(0).expand(batch_size, -1)
+            blen = block_lens[i]
+            max_start = max(0, seq_len - blen)
+            # Independent start per sample: (batch_size,)
+            starts = torch.randint(0, max_start + 1, (batch_size,), device=device)
+            # Build index tensor: (batch_size, blen)
+            offsets = torch.arange(blen, device=device).unsqueeze(0)          # (1, blen)
+            indices = (starts.unsqueeze(1) + offsets).clamp(max=seq_len - 1)  # (batch_size, blen)
+            target_blocks.append(indices)
+            # Mark positions as target
+            target_mask.scatter_(1, indices, True)
+
+        # ── 2. Context block ──────────────────────────────────────────────────────
+        # Same length drawn once; per-sample start positions.
+        context_len = min(int(random.uniform(0.85 * seq_len, seq_len)), seq_len)
+        max_start = max(0, seq_len - context_len)
+        ctx_starts = torch.randint(0, max_start + 1, (batch_size,), device=device)
+        offsets = torch.arange(context_len, device=device).unsqueeze(0)
+        ctx_candidates = (ctx_starts.unsqueeze(1) + offsets).clamp(max=seq_len - 1)  # (batch_size, context_len)
+
+        # Per-sample boolean mask of candidate context positions
+        ctx_candidate_mask = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=device)
+        ctx_candidate_mask.scatter_(1, ctx_candidates, True)
+
+        # Remove overlap with target positions
+        ctx_valid_mask = ctx_candidate_mask & ~target_mask  # (batch_size, seq_len)
+
+        # Fallback: any sample with zero valid context positions gets all non-target positions
+        empty_rows = ctx_valid_mask.sum(dim=1) == 0            # (batch_size,) bool
+        if empty_rows.any():
+            fallback = ~target_mask                            # non-target positions
+            ctx_valid_mask[empty_rows] = fallback[empty_rows]
+        # Final fallback (all positions are target): expose position 0 for those rows
+        still_empty = ctx_valid_mask.sum(dim=1) == 0
+        if still_empty.any():
+            ctx_valid_mask[still_empty, 0] = True
+
+        # ── 3. Build rectangular context tensor ───────────────────────────────────
+        # Truncate to the *minimum* valid context length across the batch so that the
+        # tensor is rectangular. This is conservative but keeps shapes fixed.
+        min_ctx = int(ctx_valid_mask.sum(dim=1).min().item())
+        min_ctx = max(1, min_ctx)
+
+        # For each sample, collect the first `min_ctx` valid positions (sorted ascending).
+        # nonzero on CPU is fastest; for GPU, argsort on the bool mask works.
+        context_indices_list = []
+        for b in range(batch_size):
+            pos = ctx_valid_mask[b].nonzero(as_tuple=False).squeeze(1)  # sorted ascending
+            context_indices_list.append(pos[:min_ctx])
+        context_indices = torch.stack(context_indices_list, dim=0)  # (batch_size, min_ctx)
+
         return context_indices, target_blocks
 
     def forward(

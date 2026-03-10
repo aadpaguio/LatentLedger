@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 """Train JEPA on Churn dataset."""
 
+import argparse
 import torch
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
@@ -8,12 +9,37 @@ from tqdm import tqdm
 import json
 from pathlib import Path
 from datetime import datetime
-
+import torch.nn.functional as F
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from models.jepa import JEPA
 from data_utils import get_dataloaders
+
+
+def parse_args():
+    """Parse CLI args; only overrides config for explicitly provided options."""
+    parser = argparse.ArgumentParser(
+        description="Train JEPA. All options override defaults from config."
+    )
+    # Data
+    parser.add_argument("--parquet-path", type=str, default=None, help="Path to parquet file")
+    parser.add_argument("--dataset", type=str, default=None, choices=["churn", "default", "hsbc", "age"], help="Dataset name")
+    parser.add_argument("--batch-size", type=int, default=None, help="Batch size")
+    parser.add_argument("--max-seq-len", type=int, default=None, help="Max sequence length")
+    # Model
+    parser.add_argument("--mcc-vocab-size", type=int, default=None, help="MCC vocab size (e.g. 101)")
+    parser.add_argument("--mcc-emb-dim", type=int, default=None, help="MCC embedding dim")
+    parser.add_argument("--d-model", type=int, default=None, help="Transformer d_model")
+    parser.add_argument("--nhead", type=int, default=None, help="Number of attention heads")
+    parser.add_argument("--num-layers", type=int, default=None, help="Encoder num layers")
+    parser.add_argument("--predictor-d-model", type=int, default=None, help="Predictor bottleneck dim")
+    parser.add_argument("--dropout", type=float, default=None, help="Dropout rate")
+    # Training
+    parser.add_argument("--learning-rate", type=float, default=None, help="Learning rate")
+    parser.add_argument("--epochs", type=int, default=None, help="Number of epochs")
+    parser.add_argument("--device", type=str, default=None, choices=["cpu", "cuda", "mps"], help="Device to train on")
+    return parser.parse_args()
 
 
 def train_epoch(model, train_loader, optimizer, device, epoch, total_steps, steps_completed):
@@ -83,7 +109,8 @@ def validate(model, val_loader, device, debug=True):
 
 def main():
     """Main training script."""
-    
+    args = parse_args()
+
     # Config (datasets match transactions_gen_models: churn, default, hsbc, age)
     project_root = Path(__file__).parent.parent
     data_dir = project_root / 'data'
@@ -99,27 +126,50 @@ def main():
         default_parquet = data_dir / 'hsbc.parquet'
         default_dataset = 'hsbc'
 
+    default_device = (
+        'mps' if getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available()
+        else 'cuda' if torch.cuda.is_available()
+        else 'cpu'
+    )
+
     config = {
         'batch_size': 32,
         'max_seq_len': 256,
         'mcc_vocab_size': 101,  # Paper: top-100 MCCs + 1 mask token (0). Use 101 for Churn/HSBC/Default/Age.
         'mcc_emb_dim': 24,  # 24 for Churn/HSBC, 16 for Age/Default (Appendix A)
-        'd_model': 1024,
-        'nhead': 8,
-        'num_layers': 6,
-        'predictor_d_model': 384,  # narrow predictor bottleneck (I-JEPA; must be divisible by nhead if predictor nhead used)
-        'dropout': 0.1,
-        'learning_rate': 1e-3,
+        'd_model': 256,
+        'nhead': 4,
+        'num_layers': 4,
+        'predictor_d_model': 96,  # narrow predictor bottleneck (I-JEPA; must be divisible by nhead if predictor nhead used)
+        'dropout': 0.2,
+        'learning_rate': 3e-4,
         'epochs': 5,  # Start small for validation
         'parquet_path': str(default_parquet),
         'dataset': default_dataset,  # churn | default | hsbc | age (same as reference repo)
-        'device': (
-            'mps' if getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available()
-            else 'cuda' if torch.cuda.is_available()
-            else 'cpu'
-        ),
+        'device': default_device,
     }
-    
+
+    # Override config from CLI (only keys that were explicitly passed)
+    cli_map = {
+        'parquet_path': args.parquet_path,
+        'dataset': args.dataset,
+        'batch_size': args.batch_size,
+        'max_seq_len': args.max_seq_len,
+        'mcc_vocab_size': args.mcc_vocab_size,
+        'mcc_emb_dim': args.mcc_emb_dim,
+        'd_model': args.d_model,
+        'nhead': args.nhead,
+        'num_layers': args.num_layers,
+        'predictor_d_model': args.predictor_d_model,
+        'dropout': args.dropout,
+        'learning_rate': args.learning_rate,
+        'epochs': args.epochs,
+        'device': args.device,
+    }
+    for key, value in cli_map.items():
+        if value is not None:
+            config[key] = value
+
     print("=" * 60)
     print("JEPA Training Configuration")
     print("=" * 60)
@@ -215,6 +265,28 @@ def main():
             if patience_counter >= patience:
                 print(f"\nEarly stopping after {epoch} epochs")
                 break
+        
+        model.eval()
+        with torch.no_grad():
+            batch = next(iter(val_loader))
+            mcc = batch['mcc'].to(device)
+            amount = batch['amount'].to(device)
+            
+            sy = model.target_encoder(mcc, amount)  # (batch, seq_len, d_model)
+            
+            # Compare at individual token level instead of mean pooled
+            tok0_u0 = sy[0, 0, :]  # user 0, token 0
+            tok0_u1 = sy[1, 0, :]  # user 1, token 0
+            tok0_u2 = sy[2, 0, :]  # user 2, token 0
+            
+            print(f"token-level u0 vs u1: {F.cosine_similarity(tok0_u0.unsqueeze(0), tok0_u1.unsqueeze(0)).item():.6f}")
+            print(f"token-level u0 vs u2: {F.cosine_similarity(tok0_u0.unsqueeze(0), tok0_u2.unsqueeze(0)).item():.6f}")
+            
+            # Also try last token (may carry more global info)
+            last0 = sy[0, -1, :]
+            last1 = sy[1, -1, :]
+            print(f"last token u0 vs u1:  {F.cosine_similarity(last0.unsqueeze(0), last1.unsqueeze(0)).item():.6f}")
+
     
     writer.close()
     
