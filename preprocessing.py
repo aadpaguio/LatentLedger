@@ -73,6 +73,22 @@ def _to_unix_timestamp(ser: pd.Series) -> np.ndarray:
     return pd.to_datetime(ser).astype("datetime64[s]").astype("int64").values // 10**9
 
 
+def fit_mcc_encoder(series: pd.Series, top_n: int = 100) -> dict[int, int]:
+    """
+    Build MCC frequency encoder: top_n most frequent codes map to 1..top_n, all others map to 0.
+
+    Args:
+        series: Raw MCC codes (e.g. df["mcc_code"]).
+        top_n: Number of top codes to keep (default 100).
+
+    Returns:
+        Dict mapping raw_mcc -> encoded index (1..top_n). Codes not in the dict should be treated as 0.
+    """
+    counts = series.value_counts()
+    top_codes = counts.head(top_n)
+    return {int(mcc): idx for idx, mcc in enumerate(top_codes.index, start=1)}
+
+
 def preprocess_flat_parquet(
     parquet_path: Path,
     dataset: Literal["churn", "churn_nodup", "default", "default_nodup", "hsbc", "hsbc_nodup", "age", "age_nodup"] = "churn",
@@ -127,6 +143,9 @@ def preprocess_flat_parquet(
         # age: no normalisation; still convert to unix seconds for consistency
         df["event_time"] = _to_unix_timestamp(df["timestamp"])
 
+    # MCC frequency encoder: top 100 -> 1..100, rest -> 0 (before groupby, so full dataset is used)
+    mcc_map = fit_mcc_encoder(df["mcc_code"], top_n=100)
+
     # 5. Group by user_id, sort by timestamp
     df = df.sort_values(["user_id", "timestamp"])
     grouped = df.groupby("user_id", sort=False)
@@ -134,10 +153,11 @@ def preprocess_flat_parquet(
     records = []
     for user_id, grp in grouped:
         grp = grp.sort_values("timestamp")
+        mcc_encoded = [mcc_map.get(int(m), 0) for m in grp["mcc_code"].values]
         rec = {
             "user_id": user_id,
             "event_time": grp["event_time"].values.tolist(),
-            "mcc_code": grp["mcc_code"].values.astype(np.int64).tolist(),
+            "mcc_code": mcc_encoded,
             "amount": grp["amount"].values.tolist(),
             "global_target": grp["global_target"].iloc[0],
         }
