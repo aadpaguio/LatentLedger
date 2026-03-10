@@ -1,0 +1,167 @@
+#!/usr/bin/env python
+"""
+Preprocessing aligned with transactions_gen_models (same datasets: churn, default, hsbc, age).
+
+Expects flat parquet from reference repo's preprocessed/ folder:
+  user_id, amount, timestamp, mcc_code, global_target
+  + dataset-specific local target: churn_target (churn/hsbc), default_target (default); age has none.
+
+Steps (mirroring config/preprocessing/*.yaml):
+  1. amount -> float32
+  2. Rename local target column to local_target (churn_target/default_target -> local_target)
+  3. Optional: drop duplicates on (user_id, timestamp), keep first
+  4. Group by user_id, sort by timestamp; output per-user records with event_time, mcc_code, amount, global_target, local_target
+  5. event_time: dt_to_timestamp (unix seconds) for churn/default/hsbc, none for age
+"""
+
+from pathlib import Path
+from typing import Any, Literal
+
+import pandas as pd
+import numpy as np
+
+
+# Dataset configs matching transactions_gen_models config/preprocessing/*.yaml
+DATASET_CONFIG = {
+    "churn": {
+        "local_target_col": "churn_target",
+        "event_time_transform": "dt_to_timestamp",
+        "drop_duplicates": False,
+    },
+    "churn_nodup": {
+        "local_target_col": "churn_target",
+        "event_time_transform": "dt_to_timestamp",
+        "drop_duplicates": True,
+    },
+    "default": {
+        "local_target_col": "default_target",
+        "event_time_transform": "dt_to_timestamp",
+        "drop_duplicates": False,
+    },
+    "default_nodup": {
+        "local_target_col": "default_target",
+        "event_time_transform": "dt_to_timestamp",
+        "drop_duplicates": True,
+    },
+    "hsbc": {
+        "local_target_col": "churn_target",
+        "event_time_transform": "dt_to_timestamp",
+        "drop_duplicates": False,
+    },
+    "hsbc_nodup": {
+        "local_target_col": "churn_target",
+        "event_time_transform": "dt_to_timestamp",
+        "drop_duplicates": True,
+    },
+    "age": {
+        "local_target_col": None,
+        "event_time_transform": "none",
+        "drop_duplicates": False,
+    },
+    "age_nodup": {
+        "local_target_col": None,
+        "event_time_transform": "none",
+        "drop_duplicates": True,
+    },
+}
+
+REQUIRED_COLUMNS = {"user_id", "amount", "timestamp", "mcc_code", "global_target"}
+
+
+def _to_unix_timestamp(ser: pd.Series) -> np.ndarray:
+    """Convert datetime column to Unix timestamp (seconds)."""
+    return pd.to_datetime(ser).astype("datetime64[s]").astype("int64").values // 10**9
+
+
+def preprocess_flat_parquet(
+    parquet_path: Path,
+    dataset: Literal["churn", "churn_nodup", "default", "default_nodup", "hsbc", "hsbc_nodup", "age", "age_nodup"] = "churn",
+) -> list[dict[str, Any]]:
+    """
+    Load flat parquet and convert to per-user records (same schema as transactions_gen_models after preprocess).
+
+    Args:
+        parquet_path: Path to preprocessed flat parquet (e.g. data/preprocessed/churn.parquet).
+        dataset: Dataset name; determines local_target column and event_time transform.
+
+    Returns:
+        List of dicts, one per user: user_id, event_time, mcc_code, amount, global_target, local_target (optional).
+    """
+    path = Path(parquet_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Parquet not found: {path}")
+
+    cfg = DATASET_CONFIG.get(dataset)
+    if cfg is None:
+        cfg = {
+            "local_target_col": None,
+            "event_time_transform": "dt_to_timestamp",
+            "drop_duplicates": False,
+        }
+
+    df = pd.read_parquet(path)
+
+    # Required columns
+    missing = REQUIRED_COLUMNS - set(df.columns)
+    if missing:
+        raise ValueError(f"Parquet missing columns: {missing}. Expected {REQUIRED_COLUMNS}.")
+
+    # 1. amount -> float32
+    df["amount"] = df["amount"].astype("float32")
+
+    # 2. Rename local target to local_target if present
+    local_col = cfg.get("local_target_col")
+    if local_col and local_col in df.columns:
+        df["local_target"] = df[local_col]
+    elif local_col and local_col not in df.columns:
+        df["local_target"] = 0  # placeholder if column missing
+
+    # 3. Drop duplicates (user_id, timestamp)
+    if cfg.get("drop_duplicates"):
+        df = df.drop_duplicates(subset=["user_id", "timestamp"], keep="first")
+
+    # 4. event_time from timestamp (always numeric for consistency)
+    if cfg.get("event_time_transform") == "dt_to_timestamp":
+        df["event_time"] = _to_unix_timestamp(df["timestamp"])
+    else:
+        # age: no normalisation; still convert to unix seconds for consistency
+        df["event_time"] = _to_unix_timestamp(df["timestamp"])
+
+    # 5. Group by user_id, sort by timestamp
+    df = df.sort_values(["user_id", "timestamp"])
+    grouped = df.groupby("user_id", sort=False)
+
+    records = []
+    for user_id, grp in grouped:
+        grp = grp.sort_values("timestamp")
+        rec = {
+            "user_id": user_id,
+            "event_time": grp["event_time"].values.tolist(),
+            "mcc_code": grp["mcc_code"].values.astype(np.int64).tolist(),
+            "amount": grp["amount"].values.tolist(),
+            "global_target": grp["global_target"].iloc[0],
+        }
+        if "local_target" in grp.columns:
+            rec["local_target"] = grp["local_target"].iloc[0]
+        records.append(rec)
+
+    return records
+
+
+def train_val_test_split(
+    records: list[dict],
+    val_size: float = 0.1,
+    test_size: float = 0.1,
+    random_state: int = 42,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Split per-user records into train/val/test (same as transactions_gen_models: 80/10/10)."""
+    from sklearn.model_selection import train_test_split
+
+    val_test_size = val_size + test_size
+    train, val_test = train_test_split(records, test_size=val_test_size, random_state=random_state)
+    val, test = train_test_split(
+        val_test,
+        test_size=test_size / val_test_size,
+        random_state=random_state,
+    )
+    return train, val, test
