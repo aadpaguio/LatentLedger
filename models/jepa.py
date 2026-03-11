@@ -24,10 +24,12 @@ class TransactionEncoder(nn.Module):
         nhead: int,
         num_layers: int,
         dropout: float = 0.1,
+        use_temporal_encoding: bool = False,
     ):
         super().__init__()
         self.d_model = d_model
         self.mcc_emb_dim = mcc_emb_dim
+        self.use_temporal_encoding = use_temporal_encoding
 
         # Paper clips rare MCCs to top-100 per dataset; mcc_vocab_size should be set to 101 (0-indexed + 1 for mask token)
         self.mcc_embedding = nn.Embedding(mcc_vocab_size, mcc_emb_dim)
@@ -36,8 +38,12 @@ class TransactionEncoder(nn.Module):
         self.input_proj = nn.Linear(mcc_emb_dim + 1, d_model)
         self.input_norm = nn.LayerNorm(d_model)
 
-        # Learned positional encodings
-        self.pos_embedding = nn.Embedding(MAX_SEQ_LEN, d_model)
+        if self.use_temporal_encoding:
+            self.time_embedding = nn.Embedding(1024, d_model)
+            self.order_embedding = nn.Embedding(32, d_model)
+        else:
+            # Learned positional encodings
+            self.pos_embedding = nn.Embedding(MAX_SEQ_LEN, d_model)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -53,6 +59,8 @@ class TransactionEncoder(nn.Module):
         mcc: torch.Tensor,
         amount: torch.Tensor,
         position_ids: Optional[torch.Tensor] = None,
+        time_bucket: Optional[torch.Tensor] = None,
+        intra_day_rank: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -60,6 +68,8 @@ class TransactionEncoder(nn.Module):
             amount: (batch, seq_len, 1) - Transaction amounts
             position_ids: Optional (batch, seq_len) - original position indices for pos embedding.
                 When provided (e.g. context-only encoding), use these instead of arange(seq_len).
+            time_bucket: Optional (batch, seq_len_full|seq_len) - day bucket per transaction.
+            intra_day_rank: Optional (batch, seq_len_full|seq_len) - chronological rank within a day.
 
         Returns:
             embeddings: (batch, seq_len, d_model)
@@ -77,13 +87,28 @@ class TransactionEncoder(nn.Module):
         combined = torch.cat([mcc_emb, amount_norm], dim=-1)  # (batch, seq_len, mcc_emb_dim + 1)
         x = self.input_norm(self.input_proj(combined))  # (batch, seq_len, d_model)
 
-        # Positional encoding: use provided indices (e.g. context positions) or 0..seq_len-1
-        if position_ids is not None:
-            pos_ids = position_ids.clamp(max=MAX_SEQ_LEN - 1)
-            x = x + self.pos_embedding(pos_ids)
+        if self.use_temporal_encoding:
+            if time_bucket is None or intra_day_rank is None:
+                raise ValueError(
+                    "time_bucket and intra_day_rank are required when use_temporal_encoding=True."
+                )
+            if position_ids is not None and time_bucket.size(1) != seq_len:
+                gather_idx = position_ids
+                time_bucket = torch.gather(time_bucket, 1, gather_idx)
+                intra_day_rank = torch.gather(intra_day_rank, 1, gather_idx)
+            x = (
+                x
+                + self.time_embedding(time_bucket.clamp(max=1023))
+                + self.order_embedding(intra_day_rank.clamp(max=31))
+            )
         else:
-            position_ids = torch.arange(seq_len, device=device, dtype=torch.long).clamp(max=MAX_SEQ_LEN - 1)
-            x = x + self.pos_embedding(position_ids).unsqueeze(0)
+            # Positional encoding: use provided indices (e.g. context positions) or 0..seq_len-1
+            if position_ids is not None:
+                pos_ids = position_ids.clamp(max=MAX_SEQ_LEN - 1)
+                x = x + self.pos_embedding(pos_ids)
+            else:
+                position_ids = torch.arange(seq_len, device=device, dtype=torch.long).clamp(max=MAX_SEQ_LEN - 1)
+                x = x + self.pos_embedding(position_ids).unsqueeze(0)
 
         # Transformer encoder
         out = self.transformer(x)  # (batch, seq_len, d_model)
@@ -178,10 +203,12 @@ class JEPA(nn.Module):
         num_layers: int = 6,  # matches MLM baseline in paper
         predictor_d_model: int = 384,  # narrow predictor bottleneck (I-JEPA Appendix A.1)
         dropout: float = 0.1,
+        use_temporal_encoding: bool = False,
     ):
         super().__init__()
 
         self.d_model = d_model
+        self.use_temporal_encoding = use_temporal_encoding
 
         # Online (context) encoder
         self.online_encoder = TransactionEncoder(
@@ -191,6 +218,7 @@ class JEPA(nn.Module):
             nhead=nhead,
             num_layers=num_layers,
             dropout=dropout,
+            use_temporal_encoding=use_temporal_encoding,
         )
 
         # Target encoder (EMA of online)
@@ -201,6 +229,7 @@ class JEPA(nn.Module):
             nhead=nhead,
             num_layers=num_layers,
             dropout=dropout,
+            use_temporal_encoding=use_temporal_encoding,
         )
 
         # Copy weights
@@ -319,11 +348,15 @@ class JEPA(nn.Module):
         self,
         mcc: torch.Tensor,
         amount: torch.Tensor,
+        time_bucket: Optional[torch.Tensor] = None,
+        intra_day_rank: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             mcc: (batch, seq_len) - MCC codes
             amount: (batch, seq_len, 1) - Transaction amounts
+            time_bucket: Optional (batch, seq_len) - days since first transaction
+            intra_day_rank: Optional (batch, seq_len) - within-day order
 
         Returns:
             loss: Scalar loss (mean over M blocks)
@@ -343,13 +376,31 @@ class JEPA(nn.Module):
         amount_context = torch.gather(
             amount, 1, context_indices.unsqueeze(-1).expand(-1, -1, 1)
         )  # (batch, num_context, 1)
+        time_bucket_context = None
+        intra_day_rank_context = None
+        if self.use_temporal_encoding:
+            if time_bucket is None or intra_day_rank is None:
+                raise ValueError(
+                    "time_bucket and intra_day_rank are required when use_temporal_encoding=True."
+                )
+            time_bucket_context = torch.gather(time_bucket, 1, context_indices)
+            intra_day_rank_context = torch.gather(intra_day_rank, 1, context_indices)
 
         sx = self.online_encoder(
-            mcc_context, amount_context, position_ids=context_indices
+            mcc_context,
+            amount_context,
+            position_ids=context_indices,
+            time_bucket=time_bucket_context,
+            intra_day_rank=intra_day_rank_context,
         )  # (batch, num_context, d_model)
 
         with torch.no_grad():
-            sy = self.target_encoder(mcc, amount)  # (batch, seq_len, d_model)
+            sy = self.target_encoder(
+                mcc,
+                amount,
+                time_bucket=time_bucket,
+                intra_day_rank=intra_day_rank,
+            )  # (batch, seq_len, d_model)
 
         total_loss = 0.0
         for i in range(M):
@@ -364,19 +415,41 @@ class JEPA(nn.Module):
         loss = total_loss / M
         return loss, sx
 
-    def get_embedding(self, mcc: torch.Tensor, amount: torch.Tensor) -> torch.Tensor:
+    def get_embedding(
+        self,
+        mcc: torch.Tensor,
+        amount: torch.Tensor,
+        time_bucket: Optional[torch.Tensor] = None,
+        intra_day_rank: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Get token-level embeddings without masking (for local evaluation, e.g. sliding window Section 3.2).
         Uses target encoder for evaluation (Appendix A.1).
         """
         with torch.no_grad():
-            return self.target_encoder(mcc, amount)
+            return self.target_encoder(
+                mcc,
+                amount,
+                time_bucket=time_bucket,
+                intra_day_rank=intra_day_rank,
+            )
 
-    def get_global_embedding(self, mcc: torch.Tensor, amount: torch.Tensor) -> torch.Tensor:
+    def get_global_embedding(
+        self,
+        mcc: torch.Tensor,
+        amount: torch.Tensor,
+        time_bucket: Optional[torch.Tensor] = None,
+        intra_day_rank: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Mean-pool token embeddings for global evaluation (fed to LightGBM).
         Uses target encoder for evaluation (Appendix A.1).
         """
         with torch.no_grad():
-            token_embeddings = self.target_encoder(mcc, amount)
+            token_embeddings = self.target_encoder(
+                mcc,
+                amount,
+                time_bucket=time_bucket,
+                intra_day_rank=intra_day_rank,
+            )
         return token_embeddings.mean(dim=1)

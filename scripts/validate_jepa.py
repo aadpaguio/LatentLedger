@@ -1,9 +1,10 @@
 #!/usr/bin/env python
 """Validate JEPA by extracting embeddings and testing downstream task."""
 
+import argparse
+import json
 import torch
-import torch.nn as nn
-from sklearn.linear_model import LogisticRegression
+import lightgbm as lgb
 from sklearn.metrics import roc_auc_score, accuracy_score, classification_report
 import numpy as np
 from tqdm import tqdm
@@ -29,10 +30,17 @@ def extract_embeddings(model, dataloader, device):
         for batch in tqdm(dataloader):
             mcc = batch['mcc'].to(device)
             amount = batch['amount'].to(device)
+            time_bucket = batch['time_bucket'].to(device)
+            intra_day_rank = batch['intra_day_rank'].to(device)
             target = batch['target'].cpu().numpy()
             
             # Get embeddings (no masking)
-            embeddings = model.get_embedding(mcc, amount)  # (batch, seq_len, emb_dim)
+            embeddings = model.get_embedding(
+                mcc,
+                amount,
+                time_bucket=time_bucket,
+                intra_day_rank=intra_day_rank,
+            )  # (batch, seq_len, emb_dim)
             
             # Global pooling (mean over sequence)
             embeddings_global = embeddings.mean(dim=1)  # (batch, emb_dim)
@@ -47,10 +55,24 @@ def extract_embeddings(model, dataloader, device):
 
 
 def train_downstream_classifier(train_embeddings, train_targets, val_embeddings, val_targets):
-    """Train logistic regression classifier on embeddings."""
-    print("\nTraining downstream classifier...")
-    
-    clf = LogisticRegression(max_iter=1000, random_state=42, n_jobs=-1)
+    """Train LightGBM classifier on embeddings."""
+    print("\nTraining downstream classifier (LightGBM)...")
+
+    clf = lgb.LGBMClassifier(
+        n_estimators=500,
+        boosting_type="gbdt",
+        subsample=0.5,
+        subsample_freq=1,
+        learning_rate=0.02,
+        feature_fraction=0.75,
+        max_depth=6,
+        lambda_l1=1,
+        lambda_l2=1,
+        min_data_in_leaf=50,
+        random_state=42,
+        n_jobs=8,
+        verbose=-1,
+    )
     clf.fit(train_embeddings, train_targets)
     
     # Validate
@@ -85,58 +107,91 @@ def evaluate_on_test(clf, test_embeddings, test_targets):
     return test_accuracy, test_auc
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Validate JEPA on downstream task.")
+    parser.add_argument(
+        "--model-dir",
+        type=str,
+        default=None,
+        help="Experiment folder: name (e.g. jepa_20250101_120000) under outputs/, or path to folder or best_model.pt. Default: latest jepa_* in outputs/.",
+    )
+    return parser.parse_args()
+
+
 def main(model_path: str = None):
     """Main validation script."""
-    
+    args = parse_args()
+    # CLI overrides: --model-dir takes precedence over model_path (for script callers)
+    model_dir_arg = args.model_dir if args.model_dir is not None else model_path
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}\n")
-    
-    # If no model path provided, find latest
-    if model_path is None:
-        outputs_dir = Path('outputs')
+
+    outputs_dir = Path('outputs')
+
+    # Resolve experiment directory and model path
+    if model_dir_arg is None:
         model_dirs = sorted(outputs_dir.glob('jepa_*'))
         if not model_dirs:
             print("✗ No trained models found in outputs/")
             return
-        latest_dir = model_dirs[-1]
-        model_path = latest_dir / 'best_model.pt'
+        exp_dir = model_dirs[-1]
+        model_path = exp_dir / 'best_model.pt'
         print(f"Using model: {model_path}\n")
     else:
-        model_path = Path(model_path)
-    
-    # Load model (architecture must match training: mcc_vocab_size, d_model, etc.)
+        p = Path(model_dir_arg)
+        if p.is_file():
+            exp_dir = p.parent
+            model_path = p
+        elif p.is_dir():
+            exp_dir = p
+            model_path = exp_dir / 'best_model.pt'
+        else:
+            # Treat as folder name under outputs/
+            exp_dir = outputs_dir / p
+            model_path = exp_dir / 'best_model.pt'
+        if not exp_dir.exists():
+            print(f"✗ Not found: {exp_dir}")
+            return
+        print(f"Using model: {model_path}\n")
+
+    if not model_path.exists():
+        print(f"✗ Weights not found: {model_path}")
+        return
+    config_path = exp_dir / 'config.json'
+    if not config_path.exists():
+        print(f"✗ Config not found: {config_path}")
+        print("  Validation requires the experiment config (saved by train_jepa.py).")
+        return
+    with open(config_path) as f:
+        config = json.load(f)
+
+    # Build model from saved config
     print("Loading JEPA model...")
     model = JEPA(
-        mcc_vocab_size=101,
-        mcc_emb_dim=24,
-        d_model=1024,
-        nhead=8,
-        num_layers=6,
-        dropout=0.1,
+        mcc_vocab_size=config['mcc_vocab_size'],
+        mcc_emb_dim=config['mcc_emb_dim'],
+        d_model=config['d_model'],
+        nhead=config['nhead'],
+        num_layers=config['num_layers'],
+        predictor_d_model=config['predictor_d_model'],
+        dropout=config['dropout'],
+        use_temporal_encoding=config.get('use_temporal_encoding', False),
     ).to(device)
-    
     model.load_state_dict(torch.load(model_path, map_location=device))
-    print(f"  Model loaded from: {model_path}\n")
-    
-    # Load data (same parquet/dataset as training; align with transactions_gen_models)
-    project_root = Path(__file__).parent.parent
-    data_dir = project_root / 'data'
-    parquet_path = data_dir / 'churn.parquet'
-    dataset = 'churn'
-    if not parquet_path.exists():
-        parquet_path = data_dir / 'age.parquet'
-        dataset = 'age'
-    if not parquet_path.exists():
-        parquet_path = data_dir / 'default.parquet'
-        dataset = 'default'
-    if not parquet_path.exists():
-        parquet_path = data_dir / 'hsbc.parquet'
-        dataset = 'hsbc'
+    print(f"  Model loaded from: {model_path}")
+    print(f"  Config from: {config_path}\n")
+
+    # Load data using same parquet/dataset/batch_size/max_seq_len as training
+    parquet_path = Path(config['parquet_path'])
+    dataset = config.get('dataset', 'churn')
+    batch_size = config.get('batch_size', 64)
+    max_seq_len = config.get('max_seq_len', 256)
     train_loader, val_loader, test_loader = get_dataloaders(
         parquet_path,
         dataset=dataset,
-        batch_size=64,
-        max_seq_len=256
+        batch_size=batch_size,
+        max_seq_len=max_seq_len,
     )
     
     # Extract embeddings
@@ -144,7 +199,7 @@ def main(model_path: str = None):
     val_emb, val_targets = extract_embeddings(model, val_loader, device)
     test_emb, test_targets = extract_embeddings(model, test_loader, device)
     
-    print(f"\nEmbedding shapes:")
+    print("\nEmbedding shapes:")
     print(f"  Train: {train_emb.shape}")
     print(f"  Val: {val_emb.shape}")
     print(f"  Test: {test_emb.shape}")

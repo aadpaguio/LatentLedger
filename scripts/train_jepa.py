@@ -35,8 +35,15 @@ def parse_args():
     parser.add_argument("--num-layers", type=int, default=None, help="Encoder num layers")
     parser.add_argument("--predictor-d-model", type=int, default=None, help="Predictor bottleneck dim")
     parser.add_argument("--dropout", type=float, default=None, help="Dropout rate")
+    parser.add_argument(
+        "--use-temporal-encoding",
+        action="store_true",
+        help="Use time-aware positional embeddings instead of ordinal position embeddings",
+    )
     # Training
     parser.add_argument("--learning-rate", type=float, default=None, help="Learning rate")
+    parser.add_argument("--weight-decay", type=float, default=None, help="Adam weight decay (default: 0.4)")
+    parser.add_argument("--no-cosine-annealing", action="store_true", help="Use constant LR instead of cosine annealing")
     parser.add_argument("--epochs", type=int, default=None, help="Number of epochs")
     parser.add_argument("--device", type=str, default=None, choices=["cpu", "cuda", "mps"], help="Device to train on")
     return parser.parse_args()
@@ -53,8 +60,15 @@ def train_epoch(model, train_loader, optimizer, device, epoch, total_steps, step
     for batch_idx, batch in enumerate(pbar):
         mcc = batch['mcc'].to(device)
         amount = batch['amount'].to(device)
+        time_bucket = batch['time_bucket'].to(device)
+        intra_day_rank = batch['intra_day_rank'].to(device)
 
-        loss, _ = model(mcc, amount)
+        loss, _ = model(
+            mcc,
+            amount,
+            time_bucket=time_bucket,
+            intra_day_rank=intra_day_rank,
+        )
 
         optimizer.zero_grad()
         loss.backward()
@@ -86,17 +100,29 @@ def validate(model, val_loader, device, debug=True):
         for batch_idx, batch in enumerate(val_loader):
             mcc = batch['mcc'].to(device)
             amount = batch['amount'].to(device)
+            time_bucket = batch['time_bucket'].to(device)
+            intra_day_rank = batch['intra_day_rank'].to(device)
             
-            loss, sx = model(mcc, amount)
+            loss, sx = model(
+                mcc,
+                amount,
+                time_bucket=time_bucket,
+                intra_day_rank=intra_day_rank,
+            )
             
             total_loss += loss.item()
             num_batches += 1
 
             if debug and batch_idx == 0:
                 # Probe target encoder directly
-                sy = model.target_encoder(mcc, amount)  # (batch, seq_len, d_model)
+                sy = model.target_encoder(
+                    mcc,
+                    amount,
+                    time_bucket=time_bucket,
+                    intra_day_rank=intra_day_rank,
+                )  # (batch, seq_len, d_model)
                 
-                print(f"\n  [Debug - first val batch]")
+                print("\n  [Debug - first val batch]")
                 print(f"  Target encoder output norm:   {sy.norm(dim=-1).mean():.4f}")
                 print(f"  Context encoder output norm:  {sx.norm(dim=-1).mean():.4f}")
                 print(f"  Target std across batch:      {sy.std(dim=0).mean():.6f}")
@@ -143,10 +169,13 @@ def main():
         'predictor_d_model': 96,  # narrow predictor bottleneck (I-JEPA; must be divisible by nhead if predictor nhead used)
         'dropout': 0.2,
         'learning_rate': 3e-4,
+        'weight_decay': 0.4,
+        'use_cosine_annealing': True,
         'epochs': 5,  # Start small for validation
         'parquet_path': str(default_parquet),
         'dataset': default_dataset,  # churn | default | hsbc | age (same as reference repo)
         'device': default_device,
+        'use_temporal_encoding': False,
     }
 
     # Override config from CLI (only keys that were explicitly passed)
@@ -162,13 +191,17 @@ def main():
         'num_layers': args.num_layers,
         'predictor_d_model': args.predictor_d_model,
         'dropout': args.dropout,
+        'use_temporal_encoding': True if args.use_temporal_encoding else None,
         'learning_rate': args.learning_rate,
+        'weight_decay': args.weight_decay,
         'epochs': args.epochs,
         'device': args.device,
     }
     for key, value in cli_map.items():
         if value is not None:
             config[key] = value
+    if args.no_cosine_annealing:
+        config['use_cosine_annealing'] = False
 
     print("=" * 60)
     print("JEPA Training Configuration")
@@ -205,6 +238,7 @@ def main():
         num_layers=config['num_layers'],
         predictor_d_model=config['predictor_d_model'],
         dropout=config['dropout'],
+        use_temporal_encoding=config.get('use_temporal_encoding', False),
     ).to(device)
     
     total_params = sum(p.numel() for p in model.parameters())
@@ -213,9 +247,17 @@ def main():
     # Optimizer
     optimizer = optim.Adam(
         model.parameters(),
-        lr=config['learning_rate']
+        lr=config['learning_rate'],
+        weight_decay=config['weight_decay'],
     )
-    
+
+    # LR schedule: cosine annealing (optional)
+    scheduler = None
+    if config['use_cosine_annealing']:
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=config['epochs'], eta_min=1e-6
+        )
+
     # Data loaders (preprocessing aligned with transactions_gen_models)
     print("\nLoading data...")
     parquet_path = Path(config['parquet_path'])
@@ -247,10 +289,14 @@ def main():
         val_loss = validate(model, val_loader, device)
         
         # Log
+        current_lr = scheduler.get_last_lr()[0] if scheduler is not None else config['learning_rate']
         writer.add_scalar('Loss/train', train_loss, epoch)
         writer.add_scalar('Loss/val', val_loss, epoch)
-        
-        print(f"Epoch {epoch}/{config['epochs']} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+        writer.add_scalar('LR', current_lr, epoch)
+        if scheduler is not None:
+            scheduler.step()
+
+        print(f"Epoch {epoch}/{config['epochs']} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | LR: {current_lr:.2e}")
         
         # Early stopping
         if val_loss < best_val_loss:
@@ -259,7 +305,7 @@ def main():
             
             # Save best model
             torch.save(model.state_dict(), exp_dir / 'best_model.pt')
-            print(f"  → Best model saved!")
+            print("  → Best model saved!")
         else:
             patience_counter += 1
             if patience_counter >= patience:
@@ -271,8 +317,15 @@ def main():
             batch = next(iter(val_loader))
             mcc = batch['mcc'].to(device)
             amount = batch['amount'].to(device)
+            time_bucket = batch['time_bucket'].to(device)
+            intra_day_rank = batch['intra_day_rank'].to(device)
             
-            sy = model.target_encoder(mcc, amount)  # (batch, seq_len, d_model)
+            sy = model.target_encoder(
+                mcc,
+                amount,
+                time_bucket=time_bucket,
+                intra_day_rank=intra_day_rank,
+            )  # (batch, seq_len, d_model)
             
             # Compare at individual token level instead of mean pooled
             tok0_u0 = sy[0, 0, :]  # user 0, token 0
@@ -307,7 +360,7 @@ def main():
     with open(exp_dir / 'results.json', 'w') as f:
         json.dump(results, f, indent=2)
     
-    print(f"\n✓ Training complete!")
+    print("\n✓ Training complete!")
     print(f"  Outputs saved to: {exp_dir}")
     print(f"  Best model: {exp_dir / 'best_model.pt'}")
     

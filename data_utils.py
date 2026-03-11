@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader, Dataset
 from typing import Tuple, Dict, List, Any, Optional, Literal
 
 from preprocessing import (
+    compute_temporal_features,
     preprocess_flat_parquet,
     train_val_test_split,
     DATASET_CONFIG,
@@ -42,24 +43,40 @@ class TransactionDataset(Dataset):
         rec = self.records[idx]
         mcc_code = rec["mcc_code"]
         amount = rec["amount"]
+        time_bucket = rec.get("time_bucket")
+        intra_day_rank = rec.get("intra_day_rank")
         seq_len = len(mcc_code)
 
         # Clamp MCC to non-negative int (padding 0)
         mccs = [max(0, int(m)) for m in mcc_code]
         amounts = [[float(a)] for a in amount]
+        if time_bucket is None:
+            time_buckets = list(range(seq_len))
+        else:
+            time_buckets = [max(0, min(1023, int(t))) for t in time_bucket]
+        if intra_day_rank is None:
+            intra_day_ranks = [0] * seq_len
+        else:
+            intra_day_ranks = [max(0, min(31, int(r))) for r in intra_day_rank]
 
         if seq_len < self.max_seq_len:
             pad_len = self.max_seq_len - seq_len
             mccs = mccs + [0] * pad_len
             amounts = amounts + [[0.0]] * pad_len
+            time_buckets = time_buckets + [0] * pad_len
+            intra_day_ranks = intra_day_ranks + [0] * pad_len
         else:
             mccs = mccs[: self.max_seq_len]
             amounts = amounts[: self.max_seq_len]
+            time_buckets = time_buckets[: self.max_seq_len]
+            intra_day_ranks = intra_day_ranks[: self.max_seq_len]
             seq_len = self.max_seq_len
 
         out = {
             "mcc": torch.tensor(mccs, dtype=torch.long),
             "amount": torch.tensor(amounts, dtype=torch.float32),
+            "time_bucket": torch.tensor(time_buckets, dtype=torch.long),
+            "intra_day_rank": torch.tensor(intra_day_ranks, dtype=torch.long),
             "global_target": torch.tensor(rec["global_target"], dtype=torch.long),
             "seq_len": seq_len,
         }
@@ -73,6 +90,8 @@ class TransactionDataset(Dataset):
 def collate_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     mcc_list = [b["mcc"] for b in batch]
     amount_list = [b["amount"] for b in batch]
+    time_bucket_list = [b["time_bucket"] for b in batch]
+    intra_day_rank_list = [b["intra_day_rank"] for b in batch]
     global_target_list = [b["global_target"] for b in batch]
     local_target_list = [b["local_target"] for b in batch]
     seq_len_list = [b["seq_len"] for b in batch]
@@ -80,6 +99,8 @@ def collate_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tenso
     return {
         "mcc": torch.stack(mcc_list),
         "amount": torch.stack(amount_list),
+        "time_bucket": torch.stack(time_bucket_list),
+        "intra_day_rank": torch.stack(intra_day_rank_list),
         "global_target": torch.stack(global_target_list),
         "local_target": torch.stack(local_target_list),
         "seq_len": torch.tensor(seq_len_list, dtype=torch.long),
@@ -128,17 +149,27 @@ def _load_legacy_per_user_parquet(
                 continue
             mcc_code = []
             amount = []
+            timestamps = []
             for t in trans:
                 if isinstance(t, dict):
                     mcc_code.append(int(t.get("mcc", t.get("mcc_code", 0))))
                     amount.append(float(t.get("amount", 0.0)))
+                    timestamps.append(t.get("timestamp", t.get("event_time")))
                 else:
                     mcc_code.append(0)
                     amount.append(0.0)
+                    timestamps.append(None)
+            if timestamps and all(ts is not None for ts in timestamps):
+                time_bucket, intra_day_rank = compute_temporal_features(timestamps)
+            else:
+                time_bucket = list(range(len(mcc_code)))
+                intra_day_rank = [0] * len(mcc_code)
             records.append({
                 "user_id": row.get("user_id", str(i)),
                 "mcc_code": mcc_code,
                 "amount": amount,
+                "time_bucket": time_bucket,
+                "intra_day_rank": intra_day_rank,
                 "global_target": int(row.get("global_target", row.get("target", 0))),
                 "local_target": int(row.get("local_target", 0)),
             })

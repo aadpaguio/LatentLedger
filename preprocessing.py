@@ -73,6 +73,21 @@ def _to_unix_timestamp(ser: pd.Series) -> np.ndarray:
     return pd.to_datetime(ser).astype("datetime64[s]").astype("int64").values // 10**9
 
 
+def compute_temporal_features(timestamps: pd.Series) -> tuple[list[int], list[int]]:
+    """Compute day bucket and intra-day rank for a chronologically sorted sequence."""
+    ts = pd.Series(pd.to_datetime(timestamps)).reset_index(drop=True)
+    calendar_day = ts.dt.normalize()
+    first_day = calendar_day.iloc[0]
+
+    time_bucket = (
+        (calendar_day - first_day).dt.days.clip(lower=0, upper=1023).astype("int64").tolist()
+    )
+    intra_day_rank = (
+        ts.groupby(calendar_day).cumcount().clip(upper=31).astype("int64").tolist()
+    )
+    return time_bucket, intra_day_rank
+
+
 def fit_mcc_encoder(series: pd.Series, top_n: int = 100) -> dict[int, int]:
     """
     Build MCC frequency encoder: top_n most frequent codes map to 1..top_n, all others map to 0.
@@ -154,11 +169,14 @@ def preprocess_flat_parquet(
     for user_id, grp in grouped:
         grp = grp.sort_values("timestamp")
         mcc_encoded = [mcc_map.get(int(m), 0) for m in grp["mcc_code"].values]
+        time_bucket, intra_day_rank = compute_temporal_features(grp["timestamp"])
         rec = {
             "user_id": user_id,
             "event_time": grp["event_time"].values.tolist(),
             "mcc_code": mcc_encoded,
             "amount": grp["amount"].values.tolist(),
+            "time_bucket": time_bucket,
+            "intra_day_rank": intra_day_rank,
             "global_target": grp["global_target"].iloc[0],
         }
         if "local_target" in grp.columns:
