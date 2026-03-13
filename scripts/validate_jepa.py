@@ -1,20 +1,33 @@
 #!/usr/bin/env python
-"""Validate JEPA by extracting embeddings and testing downstream task."""
+"""Validate JEPA by extracting embeddings and testing downstream task.
+
+Protocol aligned with transactions_gen_models:
+- Global: config/validation/global_target.yaml (LightGBM on train+val bootstrap, test only).
+- Local:  config/validation/local_target.yaml (frozen backbone + linear head, last-token local_target).
+"""
 
 import argparse
 import json
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import lightgbm as lgb
 from sklearn.metrics import roc_auc_score, accuracy_score, classification_report
 import numpy as np
 from tqdm import tqdm
 from pathlib import Path
+from torch.utils.data import DataLoader
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from models.jepa import JEPA
-from data_utils import get_dataloaders
+from data_utils import (
+    get_dataloaders,
+    get_preprocessed_splits,
+    LocalValidationDataset,
+    collate_local_batch,
+)
 
 
 def extract_embeddings(model, dataloader, device):
@@ -54,9 +67,35 @@ def extract_embeddings(model, dataloader, device):
     return embeddings, targets
 
 
-def train_downstream_classifier(train_embeddings, train_targets, val_embeddings, val_targets):
-    """Train LightGBM classifier on embeddings."""
-    print("\nTraining downstream classifier (LightGBM)...")
+def train_downstream_classifier(
+    train_embeddings,
+    train_targets,
+    val_embeddings,
+    val_targets,
+    random_state: int = 42,
+    bootstrap: bool = True,
+):
+    """Train LightGBM on train+val (with optional bootstrap). No val metrics—evaluate on test only.
+
+    Matches transactions_gen_models global_target validation:
+    - config/validation/global_target.yaml (LGBM params, random_state=42)
+    - embed train+val, bootstrap sample, fit classifier, report test metrics only.
+    """
+    # Concatenate train+val (reference: global_validation_pipeline uses train+val for fitting)
+    train_val_emb = np.concatenate([train_embeddings, val_embeddings], axis=0)
+    train_val_tgt = np.concatenate([train_targets, val_targets], axis=0)
+    N = len(train_val_emb)
+
+    if bootstrap:
+        rng = np.random.default_rng(random_state)
+        bootstrap_inds = rng.choice(N, size=N, replace=True)
+        fit_emb = train_val_emb[bootstrap_inds]
+        fit_tgt = train_val_tgt[bootstrap_inds]
+        print("\nTraining downstream classifier (LightGBM on bootstrap sample of train+val)...")
+    else:
+        fit_emb = train_val_emb
+        fit_tgt = train_val_tgt
+        print("\nTraining downstream classifier (LightGBM on train+val)...")
 
     clf = lgb.LGBMClassifier(
         n_estimators=500,
@@ -69,23 +108,12 @@ def train_downstream_classifier(train_embeddings, train_targets, val_embeddings,
         lambda_l1=1,
         lambda_l2=1,
         min_data_in_leaf=50,
-        random_state=42,
+        random_state=random_state,
         n_jobs=8,
         verbose=-1,
     )
-    clf.fit(train_embeddings, train_targets)
-    
-    # Validate
-    val_pred = clf.predict(val_embeddings)
-    val_pred_proba = clf.predict_proba(val_embeddings)[:, 1]
-    
-    val_accuracy = accuracy_score(val_targets, val_pred)
-    val_auc = roc_auc_score(val_targets, val_pred_proba)
-    
-    print(f"  Validation Accuracy: {val_accuracy:.4f}")
-    print(f"  Validation ROC-AUC: {val_auc:.4f}")
-    
-    return clf, val_accuracy, val_auc
+    clf.fit(fit_emb, fit_tgt)
+    return clf
 
 
 def evaluate_on_test(clf, test_embeddings, test_targets):
@@ -105,6 +133,149 @@ def evaluate_on_test(clf, test_embeddings, test_targets):
     print(classification_report(test_targets, test_pred, target_names=['Non-Churn', 'Churn']))
     
     return test_accuracy, test_auc
+
+
+def run_local_validation(
+    model: nn.Module,
+    parquet_path: Path,
+    dataset: str,
+    d_model: int,
+    device: torch.device,
+    val_size: float = 0.1,
+    test_size: float = 0.1,
+    random_state: int = 42,
+    max_epochs: int = 10,
+    learning_rate: float = 0.001,
+    batch_size: int = 512,
+) -> tuple[float, float]:
+    """Run local (last-token) validation: frozen backbone + linear head predicting local_target.
+
+    Matches transactions_gen_models config/validation/local_target.yaml:
+    - min_len=20, random_min_seq_len=20, random_max_seq_len=40 (train)
+    - window_size=32, window_step=16 (val/test)
+    - Binary head, BCE, Adam lr=0.001, max_epochs=10, batch_size=512.
+    Returns (val_auc, test_auc).
+    """
+    train_rec, val_rec, test_rec = get_preprocessed_splits(
+        parquet_path, dataset=dataset, val_size=val_size, test_size=test_size, random_state=random_state
+    )
+    train_ds = LocalValidationDataset(
+        train_rec,
+        min_len=20,
+        random_min_seq_len=20,
+        random_max_seq_len=40,
+        window_size=32,
+        window_step=16,
+        deterministic=False,
+        max_seq_len=40,
+        random_state=random_state,
+    )
+    val_ds = LocalValidationDataset(
+        val_rec,
+        min_len=20,
+        random_min_seq_len=20,
+        random_max_seq_len=40,
+        window_size=32,
+        window_step=16,
+        deterministic=True,
+        max_seq_len=40,
+    )
+    test_ds = LocalValidationDataset(
+        test_rec,
+        min_len=20,
+        random_min_seq_len=20,
+        random_max_seq_len=40,
+        window_size=32,
+        window_step=16,
+        deterministic=True,
+        max_seq_len=40,
+    )
+    if len(train_ds) == 0:
+        print("  No samples for local validation (e.g. no local_target or all seq < 20).")
+        return float("nan"), float("nan")
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_local_batch, num_workers=0
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_local_batch, num_workers=0
+    )
+    test_loader = DataLoader(
+        test_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_local_batch, num_workers=0
+    )
+    # Freeze backbone
+    for p in model.parameters():
+        p.requires_grad = False
+    model.eval()
+    head = nn.Linear(d_model, 1).to(device)
+    optimizer = torch.optim.Adam(head.parameters(), lr=learning_rate)
+    best_val_auc = 0.0
+    best_head_state = None
+    print("\nLocal validation (last-token local_target)...")
+    for epoch in range(max_epochs):
+        head.train()
+        for batch in train_loader:
+            mcc = batch["mcc"].to(device)
+            amount = batch["amount"].to(device)
+            time_bucket = batch["time_bucket"].to(device)
+            intra_day_rank = batch["intra_day_rank"].to(device)
+            target = batch["local_target"].to(device)
+            with torch.no_grad():
+                emb = model.get_embedding(
+                    mcc, amount, time_bucket=time_bucket, intra_day_rank=intra_day_rank
+                )
+                emb = emb.mean(dim=1)
+            logits = head(emb).squeeze(-1)
+            loss = F.binary_cross_entropy_with_logits(logits, target)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        # Eval on val
+        head.eval()
+        val_preds, val_tgts = [], []
+        with torch.no_grad():
+            for batch in val_loader:
+                mcc = batch["mcc"].to(device)
+                amount = batch["amount"].to(device)
+                time_bucket = batch["time_bucket"].to(device)
+                intra_day_rank = batch["intra_day_rank"].to(device)
+                emb = model.get_embedding(
+                    mcc, amount, time_bucket=time_bucket, intra_day_rank=intra_day_rank
+                )
+                emb = emb.mean(dim=1)
+                pred = torch.sigmoid(head(emb).squeeze(-1)).cpu().numpy()
+                val_preds.append(pred)
+                val_tgts.append(batch["local_target"].numpy())
+        val_preds = np.concatenate(val_preds, axis=0)
+        val_tgts = np.concatenate(val_tgts, axis=0)
+        val_auc = roc_auc_score(val_tgts, val_preds)
+        if val_auc > best_val_auc:
+            best_val_auc = val_auc
+            best_head_state = {k: v.cpu().clone() for k, v in head.state_dict().items()}
+    if best_head_state is not None:
+        head.load_state_dict(best_head_state)
+    head.eval()
+    test_preds, test_tgts = [], []
+    with torch.no_grad():
+        for batch in test_loader:
+            mcc = batch["mcc"].to(device)
+            amount = batch["amount"].to(device)
+            time_bucket = batch["time_bucket"].to(device)
+            intra_day_rank = batch["intra_day_rank"].to(device)
+            emb = model.get_embedding(
+                mcc, amount, time_bucket=time_bucket, intra_day_rank=intra_day_rank
+            )
+            emb = emb.mean(dim=1)
+            pred = torch.sigmoid(head(emb).squeeze(-1)).cpu().numpy()
+            test_preds.append(pred)
+            test_tgts.append(batch["local_target"].numpy())
+    test_preds = np.concatenate(test_preds, axis=0)
+    test_tgts = np.concatenate(test_tgts, axis=0)
+    test_auc = roc_auc_score(test_tgts, test_preds)
+    test_acc = accuracy_score(test_tgts, (test_preds >= 0.5).astype(np.float32))
+    print(f"  Val ROC-AUC:  {best_val_auc:.4f}")
+    print(f"  Test ROC-AUC: {test_auc:.4f}")
+    print(f"  Test Accuracy: {test_acc:.4f}")
+    return best_val_auc, test_auc
 
 
 def parse_args():
@@ -182,16 +353,23 @@ def main(model_path: str = None):
     print(f"  Model loaded from: {model_path}")
     print(f"  Config from: {config_path}\n")
 
-    # Load data using same parquet/dataset/batch_size/max_seq_len as training
+    # Load data: same parquet/dataset/split as training (transactions_gen_models protocol)
     parquet_path = Path(config['parquet_path'])
     dataset = config.get('dataset', 'churn')
-    batch_size = config.get('batch_size', 64)
     max_seq_len = config.get('max_seq_len', 256)
+    val_size = config.get('val_size', 0.1)
+    test_size = config.get('test_size', 0.1)
+    random_state = config.get('random_state', 42)
+    # Embedding extraction uses batch_size=64 to match config/validation/global_target.yaml embed_data
+    val_batch_size = 64
     train_loader, val_loader, test_loader = get_dataloaders(
         parquet_path,
         dataset=dataset,
-        batch_size=batch_size,
+        batch_size=val_batch_size,
         max_seq_len=max_seq_len,
+        val_size=val_size,
+        test_size=test_size,
+        random_state=random_state,
     )
     
     # Extract embeddings
@@ -204,31 +382,60 @@ def main(model_path: str = None):
     print(f"  Val: {val_emb.shape}")
     print(f"  Test: {test_emb.shape}")
     
-    # Train downstream classifier
-    clf, val_acc, val_auc = train_downstream_classifier(
-        train_emb, train_targets, val_emb, val_targets
+    # Train downstream classifier on train+val (bootstrap), evaluate on test only (transactions_gen_models protocol)
+    clf = train_downstream_classifier(
+        train_emb,
+        train_targets,
+        val_emb,
+        val_targets,
+        random_state=random_state,
+        bootstrap=True,
     )
     
-    # Evaluate on test
+    # Evaluate on test only (reference reports test metrics only)
     test_acc, test_auc = evaluate_on_test(clf, test_emb, test_targets)
     
-    # Print summary
+    # Print summary (protocol: transactions_gen_models global_target)
     print("\n" + "=" * 60)
-    print("VALIDATION SUMMARY")
+    print("GLOBAL VALIDATION (global_target protocol)")
     print("=" * 60)
-    print(f"Validation ROC-AUC: {val_auc:.4f}")
-    print(f"Test ROC-AUC:       {test_auc:.4f}")
-    print(f"Test Accuracy:      {test_acc:.4f}")
+    print(f"Test ROC-AUC:  {test_auc:.4f}")
+    print(f"Test Accuracy: {test_acc:.4f}")
     print("=" * 60)
-    
-    # Success criteria
+
+    # Local validation (skip for age: no local_target)
+    local_val_auc, local_test_auc = float("nan"), float("nan")
+    if dataset not in ("age", "age_nodup"):
+        local_val_auc, local_test_auc = run_local_validation(
+            model,
+            parquet_path,
+            dataset=dataset,
+            d_model=config["d_model"],
+            device=device,
+            val_size=val_size,
+            test_size=test_size,
+            random_state=random_state,
+            max_epochs=10,
+            learning_rate=0.001,
+            batch_size=512,
+        )
+        print("\n" + "=" * 60)
+        print("LOCAL VALIDATION (local_target protocol)")
+        print("=" * 60)
+        print(f"Val ROC-AUC:  {local_val_auc:.4f}")
+        print(f"Test ROC-AUC: {local_test_auc:.4f}")
+        print("=" * 60)
+    else:
+        print("\n(Skipping local validation: age dataset has no local_target)")
+
+    # Success criteria (global test AUC)
     if test_auc > 0.65:
-        print("✓ JEPA validation PASSED!")
-        print("  (Test ROC-AUC > 0.65)")
+        print("\n✓ JEPA validation PASSED!")
+        print("  (Global test ROC-AUC > 0.65)")
         return True
     else:
-        print("⚠ JEPA validation MARGINAL")
-        print(f"  (Test ROC-AUC = {test_auc:.4f}, target > 0.65)")
+        print("\n⚠ JEPA validation MARGINAL")
+        print(f"  (Global test ROC-AUC = {test_auc:.4f}, target > 0.65)")
         return False
 
 

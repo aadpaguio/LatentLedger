@@ -176,6 +176,10 @@ def main():
         'dataset': default_dataset,  # churn | default | hsbc | age (same as reference repo)
         'device': default_device,
         'use_temporal_encoding': False,
+        # Data split (match transactions_gen_models config/preprocessing/*.yaml)
+        'val_size': 0.1,
+        'test_size': 0.1,
+        'random_state': 42,
     }
 
     # Override config from CLI (only keys that were explicitly passed)
@@ -265,7 +269,10 @@ def main():
         parquet_path,
         dataset=config.get('dataset', 'churn'),
         batch_size=config['batch_size'],
-        max_seq_len=config['max_seq_len']
+        max_seq_len=config['max_seq_len'],
+        val_size=config.get('val_size', 0.1),
+        test_size=config.get('test_size', 0.1),
+        random_state=config.get('random_state', 42),
     )
     print(f"  Train batches: {len(train_loader)}")
     print(f"  Val batches: {len(val_loader)}")
