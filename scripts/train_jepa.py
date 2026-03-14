@@ -232,6 +232,10 @@ def main():
     if args.no_cosine_annealing:
         config['use_cosine_annealing'] = False
 
+    # If dataset was set via CLI but parquet_path was not, sync path to data/<dataset>.parquet
+    if args.dataset is not None and args.parquet_path is None:
+        config['parquet_path'] = str(data_dir / f"{config['dataset']}.parquet")
+
     print("=" * 60)
     print("JEPA Training Configuration")
     print("=" * 60)
