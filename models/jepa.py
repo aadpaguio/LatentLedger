@@ -6,6 +6,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional, List
+
+from losses import vicreg_cov_loss, vicreg_var_loss
 from math import pi, cos
 
 # Safe default for positional embedding; sequences longer than this are clamped.
@@ -355,6 +357,9 @@ class JEPA(nn.Module):
         amount: torch.Tensor,
         time_bucket: Optional[torch.Tensor] = None,
         intra_day_rank: Optional[torch.Tensor] = None,
+        vicreg_cov_weight: float = 0.0,
+        vicreg_var_weight: float = 0.0,
+        vicreg_gamma: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -362,9 +367,12 @@ class JEPA(nn.Module):
             amount: (batch, seq_len, 1) - Transaction amounts
             time_bucket: Optional (batch, seq_len) - days since first transaction
             intra_day_rank: Optional (batch, seq_len) - within-day order
+            vicreg_cov_weight: Weight for VICReg covariance loss on mean-pooled context (0 = off).
+            vicreg_var_weight: Weight for VICReg variance loss on mean-pooled context (0 = off).
+            vicreg_gamma: Target per-dim std for variance loss.
 
         Returns:
-            loss: Scalar loss (mean over M blocks)
+            loss: Scalar loss (mean over M blocks + optional VICReg terms)
             sx: (batch, num_context, d_model) - Context encoder output
         """
         batch_size, seq_len = mcc.shape
@@ -418,6 +426,14 @@ class JEPA(nn.Module):
             total_loss += F.mse_loss(pred_i, target_i.detach(), reduction="mean")
 
         loss = total_loss / M
+
+        if vicreg_cov_weight > 0 or vicreg_var_weight > 0:
+            z = sx.mean(dim=1)  # (batch, d_model) mean-pooled context
+            if vicreg_cov_weight > 0:
+                loss = loss + vicreg_cov_weight * vicreg_cov_loss(z)
+            if vicreg_var_weight > 0:
+                loss = loss + vicreg_var_weight * vicreg_var_loss(z, gamma=vicreg_gamma)
+
         return loss, sx
 
     def get_embedding(

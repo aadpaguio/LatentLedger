@@ -47,10 +47,25 @@ def parse_args():
     parser.add_argument("--no-cosine-annealing", action="store_true", help="Use constant LR instead of cosine annealing")
     parser.add_argument("--epochs", type=int, default=None, help="Number of epochs")
     parser.add_argument("--device", type=str, default=None, choices=["cpu", "cuda", "mps"], help="Device to train on")
+    # VICReg regularization (on mean-pooled context encoder output)
+    parser.add_argument("--vicreg-cov-weight", type=float, default=None, help="VICReg covariance loss weight (0 = off)")
+    parser.add_argument("--vicreg-var-weight", type=float, default=None, help="VICReg variance loss weight (0 = off)")
+    parser.add_argument("--vicreg-gamma", type=float, default=None, help="VICReg variance target std (default 1.0)")
     return parser.parse_args()
 
 
-def train_epoch(model, train_loader, optimizer, device, epoch, total_steps, steps_completed):
+def train_epoch(
+    model,
+    train_loader,
+    optimizer,
+    device,
+    epoch,
+    total_steps,
+    steps_completed,
+    vicreg_cov_weight: float = 0.0,
+    vicreg_var_weight: float = 0.0,
+    vicreg_gamma: float = 1.0,
+):
     """Train for one epoch. EMA decay uses global step (Appendix A.1)."""
     model.train()
     total_loss = 0.0
@@ -69,6 +84,9 @@ def train_epoch(model, train_loader, optimizer, device, epoch, total_steps, step
             amount,
             time_bucket=time_bucket,
             intra_day_rank=intra_day_rank,
+            vicreg_cov_weight=vicreg_cov_weight,
+            vicreg_var_weight=vicreg_var_weight,
+            vicreg_gamma=vicreg_gamma,
         )
 
         optimizer.zero_grad()
@@ -175,6 +193,10 @@ def main():
         'dataset': default_dataset,  # churn | default | hsbc | age (same as reference repo)
         'device': default_device,
         'use_temporal_encoding': False,
+        # VICReg regularization (0 = disabled)
+        'vicreg_cov_weight': 0.0,
+        'vicreg_var_weight': 0.0,
+        'vicreg_gamma': 1.0,
         # Data split (match transactions_gen_models config/preprocessing/*.yaml)
         'val_size': 0.1,
         'test_size': 0.1,
@@ -200,6 +222,9 @@ def main():
         'weight_decay': args.weight_decay,
         'epochs': args.epochs,
         'device': args.device,
+        'vicreg_cov_weight': args.vicreg_cov_weight,
+        'vicreg_var_weight': args.vicreg_var_weight,
+        'vicreg_gamma': args.vicreg_gamma,
     }
     for key, value in cli_map.items():
         if value is not None:
@@ -288,7 +313,16 @@ def main():
 
     for epoch in range(1, config['epochs'] + 1):
         train_loss = train_epoch(
-            model, train_loader, optimizer, device, epoch, total_steps, steps_completed
+            model,
+            train_loader,
+            optimizer,
+            device,
+            epoch,
+            total_steps,
+            steps_completed,
+            vicreg_cov_weight=config.get('vicreg_cov_weight', 0.0),
+            vicreg_var_weight=config.get('vicreg_var_weight', 0.0),
+            vicreg_gamma=config.get('vicreg_gamma', 1.0),
         )
         steps_completed += len(train_loader)
         
