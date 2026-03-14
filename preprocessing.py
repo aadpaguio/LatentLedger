@@ -161,8 +161,9 @@ def preprocess_flat_parquet(
     # MCC frequency encoder: top 100 -> 1..100, rest -> 0 (before groupby, so full dataset is used)
     mcc_map = fit_mcc_encoder(df["mcc_code"], top_n=100)
 
-    # 5. Group by user_id (order of first appearance = parquet row order, to match ptls/PandasDataPreprocessor)
-    #    so train/val/test split matches transactions_gen_models. Do NOT sort by user_id before groupby.
+    # 5. Group by user_id, sorted — matches ptls UserGroupTransformer which does sort_index()
+    #    before groupby, giving records in ascending user_id order.
+    df = df.sort_values(["user_id", "timestamp"])
     grouped = df.groupby("user_id", sort=False)
 
     records = []
@@ -191,15 +192,37 @@ def train_val_test_split(
     val_size: float = 0.1,
     test_size: float = 0.1,
     random_state: int = 42,
+    stratify_key: str | None = "local_target",
 ) -> tuple[list[dict], list[dict], list[dict]]:
-    """Split per-user records into train/val/test (same as transactions_gen_models: 80/10/10)."""
+    """Split per-user records into train/val/test (same ratio as transactions_gen_models: 80/10/10).
+
+    stratify_key: record field to stratify on. Defaults to 'local_target' so the binary
+    local target is balanced across splits even for highly imbalanced datasets (e.g. churn
+    ~0.6% positive rate). Set to None to disable stratification (plain random, matches the
+    reference repo exactly, but can yield single-class splits on small/imbalanced data).
+    Stratification is silently skipped when fewer than 2 classes are present or the key is absent.
+    """
     from sklearn.model_selection import train_test_split
 
+    def _get_strata(recs: list[dict]) -> list | None:
+        if stratify_key is None:
+            return None
+        labels = [r.get(stratify_key) for r in recs]
+        if None in labels or len(set(labels)) < 2:
+            return None
+        return labels
+
     val_test_size = val_size + test_size
-    train, val_test = train_test_split(records, test_size=val_test_size, random_state=random_state)
+    train, val_test = train_test_split(
+        records,
+        test_size=val_test_size,
+        random_state=random_state,
+        stratify=_get_strata(records),
+    )
     val, test = train_test_split(
         val_test,
         test_size=test_size / val_test_size,
         random_state=random_state,
+        stratify=_get_strata(val_test),
     )
     return train, val, test
