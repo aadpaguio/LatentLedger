@@ -330,13 +330,14 @@ def run_local_validation_mcc(
     max_epochs: int = 10,
     learning_rate: float = 0.001,
     batch_size: int = 512,
-) -> tuple[float, float]:
+) -> tuple[float, float, float, float]:
     """Run local (last-token) MCC prediction validation: frozen backbone + linear head predicting last mcc_code.
 
     Matches transactions_gen_models config/validation/event_type.yaml:
     - target_seq_col=mcc_code, same windowing as local_target.
     - Categorical head (num_classes=mcc_vocab_size), CrossEntropyLoss(ignore_index=0), Adam lr=0.001.
-    Runs for all datasets (including age). Returns (val_accuracy, test_accuracy).
+    Runs for all datasets (including age). Returns (val_acc, test_acc, val_roc_auc, test_roc_auc).
+    Multiclass ROC-AUC: ovr, macro (same as reference).
     """
     train_rec, val_rec, test_rec = get_preprocessed_splits(
         parquet_path, dataset=dataset, val_size=val_size, test_size=test_size, random_state=random_state
@@ -357,7 +358,7 @@ def run_local_validation_mcc(
     test_ds = LocalValidationDataset(test_rec, **common_kw, deterministic=True)
     if len(train_ds) == 0:
         print("  No samples for local MCC validation.")
-        return float("nan"), float("nan")
+        return float("nan"), float("nan"), float("nan"), float("nan")
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_mcc_batch, num_workers=0
     )
@@ -400,7 +401,7 @@ def run_local_validation_mcc(
             num_batches += 1
         epoch_loss = epoch_loss / num_batches if num_batches else 0.0
         head.eval()
-        val_preds, val_tgts = [], []
+        val_proba_list, val_tgts_list = [], []
         with torch.no_grad():
             for batch in val_loader:
                 mcc = batch["mcc"].to(device)
@@ -411,17 +412,23 @@ def run_local_validation_mcc(
                     mcc, amount, time_bucket=time_bucket, intra_day_rank=intra_day_rank
                 )
                 emb = emb[:, -1, :]
-                pred = head(emb).argmax(dim=1).cpu().numpy()
-                val_preds.append(pred)
-                val_tgts.append(batch["mcc_target"].numpy())
-        val_preds = np.concatenate(val_preds, axis=0)
-        val_tgts = np.concatenate(val_tgts, axis=0)
-        # Accuracy ignoring padding (class 0)
+                logits = head(emb)
+                proba = torch.softmax(logits, dim=1).cpu().numpy()
+                val_proba_list.append(proba)
+                val_tgts_list.append(batch["mcc_target"].numpy())
+        val_proba = np.concatenate(val_proba_list, axis=0)
+        val_tgts = np.concatenate(val_tgts_list, axis=0)
+        val_preds = val_proba.argmax(axis=1)
         val_mask = val_tgts != 0
         val_acc = (val_preds[val_mask] == val_tgts[val_mask]).mean() if val_mask.any() else 0.0
+        val_auc = safe_roc_auc_score(val_tgts, val_proba, multi_class="ovr", average="macro")
         if wandb.run is not None:
             wandb.log(
-                {"local_mcc_train/loss": epoch_loss, "local_mcc_val/accuracy": val_acc},
+                {
+                    "local_mcc_train/loss": epoch_loss,
+                    "local_mcc_val/accuracy": val_acc,
+                    "local_mcc_val/roc_auc": val_auc if not np.isnan(val_auc) else 0.0,
+                },
                 step=epoch,
             )
         if val_acc > best_val_acc:
@@ -430,7 +437,26 @@ def run_local_validation_mcc(
     if best_head_state is not None:
         head.load_state_dict(best_head_state)
     head.eval()
-    test_preds, test_tgts = [], []
+    # One pass over val and test with best head to get proba for ROC-AUC
+    val_proba_list, val_tgts_list = [], []
+    with torch.no_grad():
+        for batch in val_loader:
+            mcc = batch["mcc"].to(device)
+            amount = batch["amount"].to(device)
+            time_bucket = batch["time_bucket"].to(device)
+            intra_day_rank = batch["intra_day_rank"].to(device)
+            emb = model.get_embedding(
+                mcc, amount, time_bucket=time_bucket, intra_day_rank=intra_day_rank
+            )
+            emb = emb[:, -1, :]
+            proba = torch.softmax(head(emb), dim=1).cpu().numpy()
+            val_proba_list.append(proba)
+            val_tgts_list.append(batch["mcc_target"].numpy())
+    val_proba = np.concatenate(val_proba_list, axis=0)
+    val_tgts = np.concatenate(val_tgts_list, axis=0)
+    best_val_auc = safe_roc_auc_score(val_tgts, val_proba, multi_class="ovr", average="macro")
+
+    test_proba_list, test_tgts_list = [], []
     with torch.no_grad():
         for batch in test_loader:
             mcc = batch["mcc"].to(device)
@@ -441,16 +467,21 @@ def run_local_validation_mcc(
                 mcc, amount, time_bucket=time_bucket, intra_day_rank=intra_day_rank
             )
             emb = emb[:, -1, :]
-            pred = head(emb).argmax(dim=1).cpu().numpy()
-            test_preds.append(pred)
-            test_tgts.append(batch["mcc_target"].numpy())
-    test_preds = np.concatenate(test_preds, axis=0)
-    test_tgts = np.concatenate(test_tgts, axis=0)
+            proba = torch.softmax(head(emb), dim=1).cpu().numpy()
+            test_proba_list.append(proba)
+            test_tgts_list.append(batch["mcc_target"].numpy())
+    test_proba = np.concatenate(test_proba_list, axis=0)
+    test_tgts = np.concatenate(test_tgts_list, axis=0)
+    test_preds = test_proba.argmax(axis=1)
     test_mask = test_tgts != 0
     test_acc = (test_preds[test_mask] == test_tgts[test_mask]).mean() if test_mask.any() else 0.0
+    test_auc = safe_roc_auc_score(test_tgts, test_proba, multi_class="ovr", average="macro")
+
     print(f"  Val Accuracy:  {best_val_acc:.4f}")
+    print(f"  Val ROC-AUC:  {best_val_auc:.4f}")
     print(f"  Test Accuracy: {test_acc:.4f}")
-    return best_val_acc, test_acc
+    print(f"  Test ROC-AUC: {test_auc:.4f}")
+    return best_val_acc, test_acc, best_val_auc, test_auc
 
 
 def parse_args():
@@ -611,7 +642,7 @@ def main(model_path: str = None):
 
     # Local validation: MCC code prediction (all datasets, including age)
     mcc_vocab_size = config.get("mcc_vocab_size", 101)
-    local_mcc_val_acc, local_mcc_test_acc = run_local_validation_mcc(
+    local_mcc_val_acc, local_mcc_test_acc, local_mcc_val_auc, local_mcc_test_auc = run_local_validation_mcc(
         model,
         parquet_path,
         dataset=dataset,
@@ -625,12 +656,19 @@ def main(model_path: str = None):
         learning_rate=0.001,
         batch_size=512,
     )
-    wandb.log({"local_mcc/val_accuracy": local_mcc_val_acc, "local_mcc/test_accuracy": local_mcc_test_acc})
+    wandb.log({
+        "local_mcc/val_accuracy": local_mcc_val_acc,
+        "local_mcc/test_accuracy": local_mcc_test_acc,
+        "local_mcc/val_roc_auc": local_mcc_val_auc,
+        "local_mcc/test_roc_auc": local_mcc_test_auc,
+    })
     print("\n" + "=" * 60)
     print("LOCAL VALIDATION (mcc_code / event_type protocol)")
     print("=" * 60)
     print(f"Val Accuracy:  {local_mcc_val_acc:.4f}")
+    print(f"Val ROC-AUC:  {local_mcc_val_auc:.4f}")
     print(f"Test Accuracy: {local_mcc_test_acc:.4f}")
+    print(f"Test ROC-AUC: {local_mcc_test_auc:.4f}")
     print("=" * 60)
 
     wandb.finish()
