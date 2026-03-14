@@ -203,6 +203,7 @@ class JEPA(nn.Module):
         nhead: int = 8,  # matches MLM baseline in paper
         num_layers: int = 6,  # matches MLM baseline in paper
         predictor_d_model: int = 384,  # narrow predictor bottleneck (I-JEPA Appendix A.1)
+        predictor_num_layers: int = 12,  # number of transformer layers in the predictor
         dropout: float = 0.1,
         use_temporal_encoding: bool = False,
     ):
@@ -241,7 +242,7 @@ class JEPA(nn.Module):
             encoder_d_model=d_model,
             predictor_d_model=predictor_d_model,
             nhead=nhead,
-            num_layers=12,
+            num_layers=predictor_num_layers,
             dropout=dropout,
         )
 

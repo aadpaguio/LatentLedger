@@ -509,6 +509,7 @@ def main(model_path: str = None):
         nhead=config['nhead'],
         num_layers=config['num_layers'],
         predictor_d_model=config['predictor_d_model'],
+        predictor_num_layers=config.get('predictor_num_layers', 12),
         dropout=config['dropout'],
         use_temporal_encoding=config.get('use_temporal_encoding', False),
     ).to(device)

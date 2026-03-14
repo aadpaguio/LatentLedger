@@ -34,6 +34,7 @@ def parse_args():
     parser.add_argument("--nhead", type=int, default=None, help="Number of attention heads")
     parser.add_argument("--num-layers", type=int, default=None, help="Encoder num layers")
     parser.add_argument("--predictor-d-model", type=int, default=None, help="Predictor bottleneck dim")
+    parser.add_argument("--predictor-num-layers", type=int, default=None, help="Number of predictor transformer layers")
     parser.add_argument("--dropout", type=float, default=None, help="Dropout rate")
     parser.add_argument(
         "--use-temporal-encoding",
@@ -164,6 +165,7 @@ def main():
         'nhead': 4,
         'num_layers': 4,
         'predictor_d_model': 96,  # narrow predictor bottleneck (I-JEPA; must be divisible by nhead if predictor nhead used)
+        'predictor_num_layers': 12,  # number of transformer layers in the predictor
         'dropout': 0.2,
         'learning_rate': 3e-4,
         'weight_decay': 0.4,
@@ -191,6 +193,7 @@ def main():
         'nhead': args.nhead,
         'num_layers': args.num_layers,
         'predictor_d_model': args.predictor_d_model,
+        'predictor_num_layers': args.predictor_num_layers,
         'dropout': args.dropout,
         'use_temporal_encoding': True if args.use_temporal_encoding else None,
         'learning_rate': args.learning_rate,
@@ -237,6 +240,7 @@ def main():
         nhead=config['nhead'],
         num_layers=config['num_layers'],
         predictor_d_model=config['predictor_d_model'],
+        predictor_num_layers=config.get('predictor_num_layers', 12),
         dropout=config['dropout'],
         use_temporal_encoding=config.get('use_temporal_encoding', False),
     ).to(device)
