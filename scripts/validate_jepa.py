@@ -30,6 +30,13 @@ from data_utils import (
 )
 
 
+def safe_roc_auc_score(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    """ROC-AUC when both classes are present; otherwise NaN (and no sklearn warning)."""
+    if len(np.unique(y_true)) < 2:
+        return float("nan")
+    return roc_auc_score(y_true, y_score)
+
+
 def extract_embeddings(model, dataloader, device):
     """Extract embeddings from all samples."""
     model.eval()
@@ -124,7 +131,7 @@ def evaluate_on_test(clf, test_embeddings, test_targets):
     test_pred_proba = clf.predict_proba(test_embeddings)[:, 1]
     
     test_accuracy = accuracy_score(test_targets, test_pred)
-    test_auc = roc_auc_score(test_targets, test_pred_proba)
+    test_auc = safe_roc_auc_score(test_targets, test_pred_proba)
     
     print(f"  Test Accuracy: {test_accuracy:.4f}")
     print(f"  Test ROC-AUC: {test_auc:.4f}")
@@ -247,8 +254,8 @@ def run_local_validation(
                 val_tgts.append(batch["local_target"].numpy())
         val_preds = np.concatenate(val_preds, axis=0)
         val_tgts = np.concatenate(val_tgts, axis=0)
-        val_auc = roc_auc_score(val_tgts, val_preds)
-        if val_auc > best_val_auc:
+        val_auc = safe_roc_auc_score(val_tgts, val_preds)
+        if not np.isnan(val_auc) and val_auc > best_val_auc:
             best_val_auc = val_auc
             best_head_state = {k: v.cpu().clone() for k, v in head.state_dict().items()}
     if best_head_state is not None:
@@ -270,10 +277,15 @@ def run_local_validation(
             test_tgts.append(batch["local_target"].numpy())
     test_preds = np.concatenate(test_preds, axis=0)
     test_tgts = np.concatenate(test_tgts, axis=0)
-    test_auc = roc_auc_score(test_tgts, test_preds)
+    test_auc = safe_roc_auc_score(test_tgts, test_preds)
     test_acc = accuracy_score(test_tgts, (test_preds >= 0.5).astype(np.float32))
+    n_pos = int(test_tgts.sum())
+    n_neg = len(test_tgts) - n_pos
     print(f"  Val ROC-AUC:  {best_val_auc:.4f}")
-    print(f"  Test ROC-AUC: {test_auc:.4f}")
+    if np.isnan(test_auc):
+        print(f"  Test ROC-AUC: nan (test set has only one class: {n_neg} neg, {n_pos} pos)")
+    else:
+        print(f"  Test ROC-AUC: {test_auc:.4f}")
     print(f"  Test Accuracy: {test_acc:.4f}")
     return best_val_auc, test_auc
 

@@ -161,8 +161,8 @@ def preprocess_flat_parquet(
     # MCC frequency encoder: top 100 -> 1..100, rest -> 0 (before groupby, so full dataset is used)
     mcc_map = fit_mcc_encoder(df["mcc_code"], top_n=100)
 
-    # 5. Group by user_id, sort by timestamp
-    df = df.sort_values(["user_id", "timestamp"])
+    # 5. Group by user_id (order of first appearance = parquet row order, to match ptls/PandasDataPreprocessor)
+    #    so train/val/test split matches transactions_gen_models. Do NOT sort by user_id before groupby.
     grouped = df.groupby("user_id", sort=False)
 
     records = []
