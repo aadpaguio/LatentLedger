@@ -32,10 +32,17 @@ from data_utils import (
 )
 
 
-def safe_roc_auc_score(y_true: np.ndarray, y_score: np.ndarray) -> float:
-    """ROC-AUC when both classes are present; otherwise NaN (and no sklearn warning)."""
+def safe_roc_auc_score(
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    multi_class: str | None = None,
+    average: str = "weighted",
+) -> float:
+    """ROC-AUC; supports binary and multiclass. Returns NaN if fewer than 2 classes present."""
     if len(np.unique(y_true)) < 2:
         return float("nan")
+    if multi_class is not None:
+        return roc_auc_score(y_true, y_score, multi_class=multi_class, average=average)
     return roc_auc_score(y_true, y_score)
 
 
@@ -126,21 +133,29 @@ def train_downstream_classifier(
 
 
 def evaluate_on_test(clf, test_embeddings, test_targets):
-    """Evaluate on test set."""
+    """Evaluate on test set. Handles binary (churn/default/hsbc) and multiclass (age)."""
     print("\nEvaluating on test set...")
-    
+
     test_pred = clf.predict(test_embeddings)
-    test_pred_proba = clf.predict_proba(test_embeddings)[:, 1]
-    
+    test_pred_proba = clf.predict_proba(test_embeddings)
+    n_classes = len(clf.classes_)
+
     test_accuracy = accuracy_score(test_targets, test_pred)
-    test_auc = safe_roc_auc_score(test_targets, test_pred_proba)
-    
+    if n_classes == 2:
+        test_auc = safe_roc_auc_score(test_targets, test_pred_proba[:, 1])
+        target_names = ["Non-Churn", "Churn"]
+    else:
+        test_auc = safe_roc_auc_score(
+            test_targets, test_pred_proba, multi_class="ovr", average="weighted"
+        )
+        target_names = [str(c) for c in sorted(clf.classes_)]
+
     print(f"  Test Accuracy: {test_accuracy:.4f}")
     print(f"  Test ROC-AUC: {test_auc:.4f}")
-    
+
     print("\nClassification Report:")
-    print(classification_report(test_targets, test_pred, target_names=['Non-Churn', 'Churn']))
-    
+    print(classification_report(test_targets, test_pred, target_names=target_names))
+
     return test_accuracy, test_auc
 
 
