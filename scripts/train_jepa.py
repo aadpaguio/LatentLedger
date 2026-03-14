@@ -4,7 +4,7 @@
 import argparse
 import torch
 import torch.optim as optim
-from torch.utils.tensorboard import SummaryWriter
+import wandb
 from tqdm import tqdm
 import json
 from pathlib import Path
@@ -72,20 +72,17 @@ def train_epoch(model, train_loader, optimizer, device, epoch, total_steps, step
 
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
         step = steps_completed + batch_idx
         tau = model.get_ema_decay(step, total_steps)
         model._update_target_encoder(tau=tau)
 
-        # Log tau every 10 steps
-        if batch_idx % 10 == 0:
-            print(f"  step={step} | tau={tau:.6f} | loss={loss.item():.6f}")
-
+        wandb.log({"train/step_loss": loss.item(), "train/grad_norm": total_norm}, step=step)
         total_loss += loss.item()
         num_batches += 1
-        pbar.set_postfix({'loss': loss.item(), 'tau': f'{tau:.4f}'})
+        pbar.set_postfix({'loss': loss.item()})
 
     return total_loss / num_batches
 
@@ -229,8 +226,7 @@ def main():
     with open(exp_dir / 'config.json', 'w') as f:
         json.dump(config, f, indent=2)
     
-    # Setup tensorboard
-    writer = SummaryWriter(str(exp_dir / 'logs'))
+    wandb.init(project="latentledger", config=config, name=exp_dir.name)
     
     # Create model
     print("\nInitializing JEPA model...")
@@ -297,9 +293,11 @@ def main():
         
         # Log
         current_lr = scheduler.get_last_lr()[0] if scheduler is not None else config['learning_rate']
-        writer.add_scalar('Loss/train', train_loss, epoch)
-        writer.add_scalar('Loss/val', val_loss, epoch)
-        writer.add_scalar('LR', current_lr, epoch)
+        wandb.log({
+            "train/loss": train_loss,
+            "val/loss": val_loss,
+            "lr": current_lr,
+        }, step=steps_completed)
         if scheduler is not None:
             scheduler.step()
 
@@ -338,17 +336,21 @@ def main():
             tok0_u0 = sy[0, 0, :]  # user 0, token 0
             tok0_u1 = sy[1, 0, :]  # user 1, token 0
             tok0_u2 = sy[2, 0, :]  # user 2, token 0
-            
-            print(f"token-level u0 vs u1: {F.cosine_similarity(tok0_u0.unsqueeze(0), tok0_u1.unsqueeze(0)).item():.6f}")
-            print(f"token-level u0 vs u2: {F.cosine_similarity(tok0_u0.unsqueeze(0), tok0_u2.unsqueeze(0)).item():.6f}")
-            
-            # Also try last token (may carry more global info)
+            sim_tok0_u0_u1 = F.cosine_similarity(tok0_u0.unsqueeze(0), tok0_u1.unsqueeze(0)).item()
+            sim_tok0_u0_u2 = F.cosine_similarity(tok0_u0.unsqueeze(0), tok0_u2.unsqueeze(0)).item()
             last0 = sy[0, -1, :]
             last1 = sy[1, -1, :]
-            print(f"last token u0 vs u1:  {F.cosine_similarity(last0.unsqueeze(0), last1.unsqueeze(0)).item():.6f}")
+            sim_last_u0_u1 = F.cosine_similarity(last0.unsqueeze(0), last1.unsqueeze(0)).item()
+            wandb.log({
+                "token_sim/tok0_u0_vs_u1": sim_tok0_u0_u1,
+                "token_sim/tok0_u0_vs_u2": sim_tok0_u0_u2,
+                "token_sim/last_u0_vs_u1": sim_last_u0_u1,
+            }, step=steps_completed)
+            print(f"token-level u0 vs u1: {sim_tok0_u0_u1:.6f}")
+            print(f"token-level u0 vs u2: {sim_tok0_u0_u2:.6f}")
+            print(f"last token u0 vs u1:  {sim_last_u0_u1:.6f}")
 
-    
-    writer.close()
+    wandb.finish()
     
     # Test
     print("\nEvaluating on test set...")
