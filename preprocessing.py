@@ -181,7 +181,10 @@ def preprocess_flat_parquet(
             "global_target": grp["global_target"].iloc[0],
         }
         if "local_target" in grp.columns:
-            rec["local_target"] = grp["local_target"].iloc[0]
+            # Store as per-transaction sequence (matches ptls: local_target is NOT cols_first_item).
+            # LastTokenTarget in the reference repo takes [-1] of each window slice;
+            # local_target is e.g. [0,0,...,0,1,1] for a churner (last-month txns = 1).
+            rec["local_target"] = grp["local_target"].astype(int).values.tolist()
         records.append(rec)
 
     return records
@@ -207,8 +210,12 @@ def train_val_test_split(
     def _get_strata(recs: list[dict]) -> list | None:
         if stratify_key is None:
             return None
-        labels = [r.get(stratify_key) for r in recs]
-        if None in labels or len(set(labels)) < 2:
+        raw = [r.get(stratify_key) for r in recs]
+        if None in raw:
+            return None
+        # local_target is a per-transaction list → collapse to user-level binary (any positive)
+        labels = [int(any(v) if isinstance(v, list) else v) for v in raw]
+        if len(set(labels)) < 2:
             return None
         return labels
 

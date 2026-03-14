@@ -81,7 +81,10 @@ class TransactionDataset(Dataset):
             "seq_len": seq_len,
         }
         if "local_target" in rec:
-            out["local_target"] = torch.tensor(rec["local_target"], dtype=torch.long)
+            lt = rec["local_target"]
+            # local_target is stored as a per-transaction list; collapse to user-level binary
+            lt_scalar = int(any(lt)) if isinstance(lt, list) else int(lt)
+            out["local_target"] = torch.tensor(lt_scalar, dtype=torch.long)
         else:
             out["local_target"] = torch.tensor(0, dtype=torch.long)
         return out
@@ -184,12 +187,13 @@ def _load_legacy_per_user_parquet(
 # --- Local validation dataset (transactions_gen_models last-token protocol) ---
 
 class LocalValidationDataset(Dataset):
-    """Last-token local validation: sequence slices with target = user's local_target.
+    """Last-token local validation: sequence slices with target = last local_target in window.
 
-    Matches config/validation/local_target.yaml:
+    Matches config/validation/local_target.yaml + LastTokenTarget in transactions_gen_models:
     - min_len=20, random_min_seq_len=20, random_max_seq_len=40 (train)
     - window_size=32, window_step=16 (val/test, deterministic)
-    - target_seq_col=local_target (binary per user)
+    - target_seq_col=local_target; target = local_target[window_end - 1]
+      (last transaction's per-transaction label, e.g. 1 if in pre-churn month, else 0)
     """
 
     def __init__(
@@ -253,12 +257,16 @@ class LocalValidationDataset(Dataset):
             amounts = amounts[: self.max_seq_len]
             time_buckets = time_buckets[: self.max_seq_len]
             intra_day_ranks = intra_day_ranks[: self.max_seq_len]
+        # local_target is a per-transaction list; take the last element of this window slice
+        # (matches LastTokenTarget in transactions_gen_models: target = x["local_target"][-1])
+        local_tgt_seq = rec["local_target"]
+        local_tgt = float(local_tgt_seq[end - 1]) if isinstance(local_tgt_seq, list) else float(local_tgt_seq)
         return {
             "mcc": torch.tensor(mccs, dtype=torch.long),
             "amount": torch.tensor(amounts, dtype=torch.float32),
             "time_bucket": torch.tensor(time_buckets, dtype=torch.long),
             "intra_day_rank": torch.tensor(intra_day_ranks, dtype=torch.long),
-            "local_target": torch.tensor(rec["local_target"], dtype=torch.float32),
+            "local_target": torch.tensor(local_tgt, dtype=torch.float32),
         }
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
