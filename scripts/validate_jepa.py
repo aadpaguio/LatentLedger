@@ -8,6 +8,7 @@ Protocol aligned with transactions_gen_models:
 
 import argparse
 import json
+import wandb
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -220,6 +221,8 @@ def run_local_validation(
     print("\nLocal validation (last-token local_target)...")
     for epoch in range(max_epochs):
         head.train()
+        epoch_loss = 0.0
+        num_batches = 0
         for batch in train_loader:
             mcc = batch["mcc"].to(device)
             amount = batch["amount"].to(device)
@@ -236,6 +239,9 @@ def run_local_validation(
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            epoch_loss += loss.item()
+            num_batches += 1
+        epoch_loss = epoch_loss / num_batches if num_batches else 0.0
         # Eval on val
         head.eval()
         val_preds, val_tgts = [], []
@@ -255,6 +261,11 @@ def run_local_validation(
         val_preds = np.concatenate(val_preds, axis=0)
         val_tgts = np.concatenate(val_tgts, axis=0)
         val_auc = safe_roc_auc_score(val_tgts, val_preds)
+        if wandb.run is not None:
+            wandb.log(
+                {"local_train/loss": epoch_loss, "local_val/roc_auc": val_auc if not np.isnan(val_auc) else 0.0},
+                step=epoch,
+            )
         if not np.isnan(val_auc) and val_auc > best_val_auc:
             best_val_auc = val_auc
             best_head_state = {k: v.cpu().clone() for k, v in head.state_dict().items()}
@@ -349,6 +360,9 @@ def main(model_path: str = None):
     with open(config_path) as f:
         config = json.load(f)
 
+    wandb_config = {**config, "model_path": str(model_path), "exp_dir": str(exp_dir)}
+    wandb.init(project="latentledger", job_type="validation", config=wandb_config)
+
     # Build model from saved config
     print("Loading JEPA model...")
     model = JEPA(
@@ -406,7 +420,8 @@ def main(model_path: str = None):
     
     # Evaluate on test only (reference reports test metrics only)
     test_acc, test_auc = evaluate_on_test(clf, test_emb, test_targets)
-    
+    wandb.log({"global/test_accuracy": test_acc, "global/test_roc_auc": test_auc})
+
     # Print summary (protocol: transactions_gen_models global_target)
     print("\n" + "=" * 60)
     print("GLOBAL VALIDATION (global_target protocol)")
@@ -431,6 +446,7 @@ def main(model_path: str = None):
             learning_rate=0.001,
             batch_size=512,
         )
+        wandb.log({"local/val_roc_auc": local_val_auc, "local/test_roc_auc": local_test_auc})
         print("\n" + "=" * 60)
         print("LOCAL VALIDATION (local_target protocol)")
         print("=" * 60)
@@ -440,6 +456,7 @@ def main(model_path: str = None):
     else:
         print("\n(Skipping local validation: age dataset has no local_target)")
 
+    wandb.finish()
     # Success criteria (global test AUC)
     if test_auc > 0.65:
         print("\n✓ JEPA validation PASSED!")
@@ -453,4 +470,4 @@ def main(model_path: str = None):
 
 if __name__ == "__main__":
     success = main()
-    exit(0 if success else 1)
+    sys.exit(0 if success else 1)
