@@ -28,6 +28,7 @@ from data_utils import (
     get_preprocessed_splits,
     LocalValidationDataset,
     collate_local_batch,
+    collate_mcc_batch,
 )
 
 
@@ -301,6 +302,142 @@ def run_local_validation(
     return best_val_auc, test_auc
 
 
+def run_local_validation_mcc(
+    model: nn.Module,
+    parquet_path: Path,
+    dataset: str,
+    d_model: int,
+    mcc_vocab_size: int,
+    device: torch.device,
+    val_size: float = 0.1,
+    test_size: float = 0.1,
+    random_state: int = 42,
+    max_epochs: int = 10,
+    learning_rate: float = 0.001,
+    batch_size: int = 512,
+) -> tuple[float, float]:
+    """Run local (last-token) MCC prediction validation: frozen backbone + linear head predicting last mcc_code.
+
+    Matches transactions_gen_models config/validation/event_type.yaml:
+    - target_seq_col=mcc_code, same windowing as local_target.
+    - Categorical head (num_classes=mcc_vocab_size), CrossEntropyLoss(ignore_index=0), Adam lr=0.001.
+    Runs for all datasets (including age). Returns (val_accuracy, test_accuracy).
+    """
+    train_rec, val_rec, test_rec = get_preprocessed_splits(
+        parquet_path, dataset=dataset, val_size=val_size, test_size=test_size, random_state=random_state
+    )
+    common_kw = dict(
+        min_len=20,
+        random_min_seq_len=20,
+        random_max_seq_len=40,
+        window_size=32,
+        window_step=16,
+        max_seq_len=40,
+        target_seq_col="mcc_code",
+    )
+    train_ds = LocalValidationDataset(
+        train_rec, **common_kw, deterministic=False, random_state=random_state
+    )
+    val_ds = LocalValidationDataset(val_rec, **common_kw, deterministic=True)
+    test_ds = LocalValidationDataset(test_rec, **common_kw, deterministic=True)
+    if len(train_ds) == 0:
+        print("  No samples for local MCC validation.")
+        return float("nan"), float("nan")
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_mcc_batch, num_workers=0
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_mcc_batch, num_workers=0
+    )
+    test_loader = DataLoader(
+        test_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_mcc_batch, num_workers=0
+    )
+    for p in model.parameters():
+        p.requires_grad = False
+    model.eval()
+    head = nn.Linear(d_model, mcc_vocab_size).to(device)
+    optimizer = torch.optim.Adam(head.parameters(), lr=learning_rate)
+    criterion = nn.CrossEntropyLoss(ignore_index=0)
+    best_val_acc = 0.0
+    best_head_state = None
+    print("\nLocal validation (last-token mcc_code)...")
+    for epoch in range(max_epochs):
+        head.train()
+        epoch_loss = 0.0
+        num_batches = 0
+        for batch in train_loader:
+            mcc = batch["mcc"].to(device)
+            amount = batch["amount"].to(device)
+            time_bucket = batch["time_bucket"].to(device)
+            intra_day_rank = batch["intra_day_rank"].to(device)
+            target = batch["mcc_target"].to(device)
+            with torch.no_grad():
+                emb = model.get_embedding(
+                    mcc, amount, time_bucket=time_bucket, intra_day_rank=intra_day_rank
+                )
+                emb = emb[:, -1, :]
+            logits = head(emb)
+            loss = criterion(logits, target)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+            num_batches += 1
+        epoch_loss = epoch_loss / num_batches if num_batches else 0.0
+        head.eval()
+        val_preds, val_tgts = [], []
+        with torch.no_grad():
+            for batch in val_loader:
+                mcc = batch["mcc"].to(device)
+                amount = batch["amount"].to(device)
+                time_bucket = batch["time_bucket"].to(device)
+                intra_day_rank = batch["intra_day_rank"].to(device)
+                emb = model.get_embedding(
+                    mcc, amount, time_bucket=time_bucket, intra_day_rank=intra_day_rank
+                )
+                emb = emb[:, -1, :]
+                pred = head(emb).argmax(dim=1).cpu().numpy()
+                val_preds.append(pred)
+                val_tgts.append(batch["mcc_target"].numpy())
+        val_preds = np.concatenate(val_preds, axis=0)
+        val_tgts = np.concatenate(val_tgts, axis=0)
+        # Accuracy ignoring padding (class 0)
+        val_mask = val_tgts != 0
+        val_acc = (val_preds[val_mask] == val_tgts[val_mask]).mean() if val_mask.any() else 0.0
+        if wandb.run is not None:
+            wandb.log(
+                {"local_mcc_train/loss": epoch_loss, "local_mcc_val/accuracy": val_acc},
+                step=epoch,
+            )
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_head_state = {k: v.cpu().clone() for k, v in head.state_dict().items()}
+    if best_head_state is not None:
+        head.load_state_dict(best_head_state)
+    head.eval()
+    test_preds, test_tgts = [], []
+    with torch.no_grad():
+        for batch in test_loader:
+            mcc = batch["mcc"].to(device)
+            amount = batch["amount"].to(device)
+            time_bucket = batch["time_bucket"].to(device)
+            intra_day_rank = batch["intra_day_rank"].to(device)
+            emb = model.get_embedding(
+                mcc, amount, time_bucket=time_bucket, intra_day_rank=intra_day_rank
+            )
+            emb = emb[:, -1, :]
+            pred = head(emb).argmax(dim=1).cpu().numpy()
+            test_preds.append(pred)
+            test_tgts.append(batch["mcc_target"].numpy())
+    test_preds = np.concatenate(test_preds, axis=0)
+    test_tgts = np.concatenate(test_tgts, axis=0)
+    test_mask = test_tgts != 0
+    test_acc = (test_preds[test_mask] == test_tgts[test_mask]).mean() if test_mask.any() else 0.0
+    print(f"  Val Accuracy:  {best_val_acc:.4f}")
+    print(f"  Test Accuracy: {test_acc:.4f}")
+    return best_val_acc, test_acc
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Validate JEPA on downstream task.")
     parser.add_argument(
@@ -430,7 +567,7 @@ def main(model_path: str = None):
     print(f"Test Accuracy: {test_acc:.4f}")
     print("=" * 60)
 
-    # Local validation (skip for age: no local_target)
+    # Local validation: label prediction (skip for age: no local_target)
     local_val_auc, local_test_auc = float("nan"), float("nan")
     if dataset not in ("age", "age_nodup"):
         local_val_auc, local_test_auc = run_local_validation(
@@ -454,7 +591,31 @@ def main(model_path: str = None):
         print(f"Test ROC-AUC: {local_test_auc:.4f}")
         print("=" * 60)
     else:
-        print("\n(Skipping local validation: age dataset has no local_target)")
+        print("\n(Skipping local_target validation: age dataset has no local_target)")
+
+    # Local validation: MCC code prediction (all datasets, including age)
+    mcc_vocab_size = config.get("mcc_vocab_size", 101)
+    local_mcc_val_acc, local_mcc_test_acc = run_local_validation_mcc(
+        model,
+        parquet_path,
+        dataset=dataset,
+        d_model=config["d_model"],
+        mcc_vocab_size=mcc_vocab_size,
+        device=device,
+        val_size=val_size,
+        test_size=test_size,
+        random_state=random_state,
+        max_epochs=10,
+        learning_rate=0.001,
+        batch_size=512,
+    )
+    wandb.log({"local_mcc/val_accuracy": local_mcc_val_acc, "local_mcc/test_accuracy": local_mcc_test_acc})
+    print("\n" + "=" * 60)
+    print("LOCAL VALIDATION (mcc_code / event_type protocol)")
+    print("=" * 60)
+    print(f"Val Accuracy:  {local_mcc_val_acc:.4f}")
+    print(f"Test Accuracy: {local_mcc_test_acc:.4f}")
+    print("=" * 60)
 
     wandb.finish()
     # Success criteria (global test AUC)

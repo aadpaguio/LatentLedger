@@ -187,13 +187,13 @@ def _load_legacy_per_user_parquet(
 # --- Local validation dataset (transactions_gen_models last-token protocol) ---
 
 class LocalValidationDataset(Dataset):
-    """Last-token local validation: sequence slices with target = last local_target in window.
+    """Last-token validation: sequence slices with target = last value in window for target_seq_col.
 
-    Matches config/validation/local_target.yaml + LastTokenTarget in transactions_gen_models:
+    Matches config/validation/local_target.yaml and event_type.yaml + LastTokenTarget in transactions_gen_models:
     - min_len=20, random_min_seq_len=20, random_max_seq_len=40 (train)
     - window_size=32, window_step=16 (val/test, deterministic)
-    - target_seq_col=local_target; target = local_target[window_end - 1]
-      (last transaction's per-transaction label, e.g. 1 if in pre-churn month, else 0)
+    - target_seq_col='local_target': target = local_target[window_end - 1] (binary label)
+    - target_seq_col='mcc_code': target = mcc_code[window_end - 1] (MCC class, for event_type validation)
     """
 
     def __init__(
@@ -207,8 +207,13 @@ class LocalValidationDataset(Dataset):
         deterministic: bool = False,
         max_seq_len: int = 40,
         random_state: Optional[int] = None,
+        target_seq_col: Literal["local_target", "mcc_code"] = "local_target",
     ):
-        self.records = [r for r in records if len(r["mcc_code"]) >= min_len and "local_target" in r]
+        self.target_seq_col = target_seq_col
+        if target_seq_col == "local_target":
+            self.records = [r for r in records if len(r["mcc_code"]) >= min_len and "local_target" in r]
+        else:
+            self.records = [r for r in records if len(r["mcc_code"]) >= min_len]
         self.min_len = min_len
         self.random_min = random_min_seq_len
         self.random_max = random_max_seq_len
@@ -257,17 +262,22 @@ class LocalValidationDataset(Dataset):
             amounts = amounts[: self.max_seq_len]
             time_buckets = time_buckets[: self.max_seq_len]
             intra_day_ranks = intra_day_ranks[: self.max_seq_len]
-        # local_target is a per-transaction list; take the last element of this window slice
-        # (matches LastTokenTarget in transactions_gen_models: target = x["local_target"][-1])
-        local_tgt_seq = rec["local_target"]
-        local_tgt = float(local_tgt_seq[end - 1]) if isinstance(local_tgt_seq, list) else float(local_tgt_seq)
-        return {
+        out = {
             "mcc": torch.tensor(mccs, dtype=torch.long),
             "amount": torch.tensor(amounts, dtype=torch.float32),
             "time_bucket": torch.tensor(time_buckets, dtype=torch.long),
             "intra_day_rank": torch.tensor(intra_day_ranks, dtype=torch.long),
-            "local_target": torch.tensor(local_tgt, dtype=torch.float32),
         }
+        if self.target_seq_col == "local_target":
+            # (matches LastTokenTarget: target = x["local_target"][-1])
+            local_tgt_seq = rec["local_target"]
+            local_tgt = float(local_tgt_seq[end - 1]) if isinstance(local_tgt_seq, list) else float(local_tgt_seq)
+            out["local_target"] = torch.tensor(local_tgt, dtype=torch.float32)
+        else:
+            # target_seq_col == "mcc_code": last MCC in window (event_type validation)
+            last_mcc = int(rec["mcc_code"][end - 1])
+            out["mcc_target"] = torch.tensor(last_mcc, dtype=torch.long)
+        return out
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         if self.deterministic:
@@ -289,6 +299,17 @@ def collate_local_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch
         "time_bucket": torch.stack([b["time_bucket"] for b in batch]),
         "intra_day_rank": torch.stack([b["intra_day_rank"] for b in batch]),
         "local_target": torch.stack([b["local_target"] for b in batch]),
+    }
+
+
+def collate_mcc_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    """Collate for last-token MCC (event_type) validation."""
+    return {
+        "mcc": torch.stack([b["mcc"] for b in batch]),
+        "amount": torch.stack([b["amount"] for b in batch]),
+        "time_bucket": torch.stack([b["time_bucket"] for b in batch]),
+        "intra_day_rank": torch.stack([b["intra_day_rank"] for b in batch]),
+        "mcc_target": torch.stack([b["mcc_target"] for b in batch]),
     }
 
 
