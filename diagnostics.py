@@ -99,7 +99,7 @@ def compute_collapse_diagnostics(
     # -- 3. Parameter L2 distance --
     l2_sq = 0.0
     for p_ctx, p_tgt in zip(
-        model.context_encoder.parameters(),
+        model.online_encoder.parameters(),
         model.target_encoder.parameters(),
     ):
         l2_sq += (p_ctx.data - p_tgt.data).pow(2).sum().item()
