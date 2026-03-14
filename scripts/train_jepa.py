@@ -9,12 +9,12 @@ from tqdm import tqdm
 import json
 from pathlib import Path
 from datetime import datetime
-import torch.nn.functional as F
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from models.jepa import JEPA
 from data_utils import get_dataloaders
+from diagnostics import compute_collapse_diagnostics
 
 
 def parse_args():
@@ -317,38 +317,12 @@ def main():
                 print(f"\nEarly stopping after {epoch} epochs")
                 break
         
-        model.eval()
-        with torch.no_grad():
-            batch = next(iter(val_loader))
-            mcc = batch['mcc'].to(device)
-            amount = batch['amount'].to(device)
-            time_bucket = batch['time_bucket'].to(device)
-            intra_day_rank = batch['intra_day_rank'].to(device)
-            
-            sy = model.target_encoder(
-                mcc,
-                amount,
-                time_bucket=time_bucket,
-                intra_day_rank=intra_day_rank,
-            )  # (batch, seq_len, d_model)
-            
-            # Compare at individual token level instead of mean pooled
-            tok0_u0 = sy[0, 0, :]  # user 0, token 0
-            tok0_u1 = sy[1, 0, :]  # user 1, token 0
-            tok0_u2 = sy[2, 0, :]  # user 2, token 0
-            sim_tok0_u0_u1 = F.cosine_similarity(tok0_u0.unsqueeze(0), tok0_u1.unsqueeze(0)).item()
-            sim_tok0_u0_u2 = F.cosine_similarity(tok0_u0.unsqueeze(0), tok0_u2.unsqueeze(0)).item()
-            last0 = sy[0, -1, :]
-            last1 = sy[1, -1, :]
-            sim_last_u0_u1 = F.cosine_similarity(last0.unsqueeze(0), last1.unsqueeze(0)).item()
-            wandb.log({
-                "token_sim/tok0_u0_vs_u1": sim_tok0_u0_u1,
-                "token_sim/tok0_u0_vs_u2": sim_tok0_u0_u2,
-                "token_sim/last_u0_vs_u1": sim_last_u0_u1,
-            }, step=steps_completed)
-            print(f"token-level u0 vs u1: {sim_tok0_u0_u1:.6f}")
-            print(f"token-level u0 vs u2: {sim_tok0_u0_u2:.6f}")
-            print(f"last token u0 vs u1:  {sim_last_u0_u1:.6f}")
+        diag = compute_collapse_diagnostics(model, val_loader, device, n_batches=3)
+        wandb.log(diag, step=steps_completed)
+        print(f"  eff_rank={diag['diagnostics/effective_rank']:.1f}  "
+              f"cos_sim={diag['diagnostics/encoder_cosine_sim']:.4f}  "
+              f"probe_auc={diag['diagnostics/probe_roc_auc']:.3f}  "
+              f"param_l2={diag['diagnostics/param_l2_distance']:.2f}")
 
     wandb.finish()
     
