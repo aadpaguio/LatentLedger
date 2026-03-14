@@ -226,7 +226,7 @@ def main():
     with open(exp_dir / 'config.json', 'w') as f:
         json.dump(config, f, indent=2)
     
-    wandb.init(project="latentledger", config=config, name=exp_dir.name)
+    wandb.init(project="latentledger", job_type="training", config=config, name=exp_dir.name)
     
     # Create model
     print("\nInitializing JEPA model...")
