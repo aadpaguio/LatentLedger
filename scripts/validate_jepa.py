@@ -230,7 +230,7 @@ def run_local_validation(
                 emb = model.get_embedding(
                     mcc, amount, time_bucket=time_bucket, intra_day_rank=intra_day_rank
                 )
-                emb = emb.mean(dim=1)
+                emb = emb[:, -1, :]  # last-token, matches last-hidden-state of RNN baselines
             logits = head(emb).squeeze(-1)
             loss = F.binary_cross_entropy_with_logits(logits, target)
             optimizer.zero_grad()
@@ -248,7 +248,7 @@ def run_local_validation(
                 emb = model.get_embedding(
                     mcc, amount, time_bucket=time_bucket, intra_day_rank=intra_day_rank
                 )
-                emb = emb.mean(dim=1)
+                emb = emb[:, -1, :]
                 pred = torch.sigmoid(head(emb).squeeze(-1)).cpu().numpy()
                 val_preds.append(pred)
                 val_tgts.append(batch["local_target"].numpy())
@@ -271,7 +271,7 @@ def run_local_validation(
             emb = model.get_embedding(
                 mcc, amount, time_bucket=time_bucket, intra_day_rank=intra_day_rank
             )
-            emb = emb.mean(dim=1)
+            emb = emb[:, -1, :]
             pred = torch.sigmoid(head(emb).squeeze(-1)).cpu().numpy()
             test_preds.append(pred)
             test_tgts.append(batch["local_target"].numpy())

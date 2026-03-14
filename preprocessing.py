@@ -195,7 +195,7 @@ def train_val_test_split(
     val_size: float = 0.1,
     test_size: float = 0.1,
     random_state: int = 42,
-    stratify_key: str | None = "local_target",
+    stratify_key: str | None = None,
 ) -> tuple[list[dict], list[dict], list[dict]]:
     """Split per-user records into train/val/test (same ratio as transactions_gen_models: 80/10/10).
 
