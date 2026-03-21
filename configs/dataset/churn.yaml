@@ -1,0 +1,7 @@
+name: churn
+parquet_path: data/churn.parquet
+mcc_emb_dim: 24
+mcc_vocab_size: 101
+has_local_target: true
+has_timestamps: true
+max_seq_len: 256

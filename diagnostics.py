@@ -59,8 +59,8 @@ def compute_collapse_diagnostics(
             time_bucket = batch['time_bucket'].to(device)
             intra_day_rank = batch['intra_day_rank'].to(device)
 
-            # Context encoder (via get_embedding — matches validate_jepa.py)
-            ctx = model.get_embedding(
+            # Context encoder (online); target encoder compared separately below
+            ctx = model.get_online_embedding(
                 mcc, amount,
                 time_bucket=time_bucket,
                 intra_day_rank=intra_day_rank,

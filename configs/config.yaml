@@ -1,0 +1,15 @@
+defaults:
+  - dataset: churn
+  - model: small
+  - training: default
+  - _self_
+
+seed: 42
+use_temporal_encoding: true
+# null = auto (mps > cuda > cpu)
+device: null
+
+wandb:
+  project: latentledger
+  group: benchmark_v1
+  tags: ["jepa", "${dataset.name}", "${model.size_name}"]

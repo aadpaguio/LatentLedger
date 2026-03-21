@@ -1,0 +1,7 @@
+name: age
+parquet_path: data/age.parquet
+mcc_emb_dim: 16
+mcc_vocab_size: 101
+has_local_target: false
+has_timestamps: false
+max_seq_len: 256

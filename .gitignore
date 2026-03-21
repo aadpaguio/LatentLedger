@@ -11,3 +11,8 @@ wheels/
 
 # Data
 *.parquet
+
+# Training runs and experiment tracking
+outputs/
+wandb/
+.DS_Store

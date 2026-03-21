@@ -1,0 +1,7 @@
+size_name: small
+d_model: 256
+nhead: 4
+num_layers: 4
+predictor_d_model: 96
+predictor_num_layers: 6
+dropout: 0.2

@@ -1,0 +1,7 @@
+name: default
+parquet_path: data/default.parquet
+mcc_emb_dim: 16
+mcc_vocab_size: 101
+has_local_target: true
+has_timestamps: true
+max_seq_len: 256

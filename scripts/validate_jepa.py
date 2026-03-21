@@ -6,6 +6,8 @@ Protocol aligned with transactions_gen_models:
 - Local:  config/validation/local_target.yaml (frozen backbone + linear head, last-token local_target).
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import wandb
@@ -495,46 +497,95 @@ def parse_args():
     return parser.parse_args()
 
 
-def main(model_path: str = None):
-    """Main validation script."""
-    args = parse_args()
-    # CLI overrides: --model-dir takes precedence over model_path (for script callers)
-    model_dir_arg = args.model_dir if args.model_dir is not None else model_path
+def _get_project_root() -> Path:
+    try:
+        import hydra
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        return Path(hydra.utils.get_original_cwd())
+    except ImportError:
+        return Path.cwd()
+
+
+def _find_latest_checkpoint(outputs_dir: Path) -> tuple[Path, Path] | tuple[None, None]:
+    """Return (exp_dir, best_model.pt) for the most recently modified checkpoint under outputs/."""
+    candidates: list[tuple[float, Path, Path]] = []
+    if not outputs_dir.is_dir():
+        return None, None
+    for pt in outputs_dir.rglob("best_model.pt"):
+        exp_dir = pt.parent
+        try:
+            mtime = pt.stat().st_mtime
+        except OSError:
+            continue
+        candidates.append((mtime, exp_dir, pt))
+    if not candidates:
+        return None, None
+    candidates.sort(key=lambda x: x[0])
+    _, exp_dir, pt = candidates[-1]
+    return exp_dir, pt
+
+
+def resolve_experiment_paths(
+    model_dir_arg: str | None,
+    experiment_dir_cfg: str | None,
+    outputs_dir: Path | None = None,
+) -> tuple[Path | None, Path | None]:
+    """
+    Resolve (exp_dir, model_path). Hydra: experiment_dir_cfg is relative to original cwd.
+    """
+    root = _get_project_root()
+    outputs_dir = outputs_dir or (root / "outputs")
+
+    if model_dir_arg is not None:
+        p = Path(model_dir_arg)
+        if not p.is_absolute():
+            p = root / p
+        if p.is_file():
+            return p.parent, p
+        if p.is_dir():
+            return p, p / "best_model.pt"
+        exp_dir = outputs_dir / model_dir_arg
+        return exp_dir, exp_dir / "best_model.pt"
+
+    if experiment_dir_cfg:
+        exp_dir = Path(experiment_dir_cfg)
+        if not exp_dir.is_absolute():
+            exp_dir = root / exp_dir
+        return exp_dir, exp_dir / "best_model.pt"
+
+    exp_dir, pt = _find_latest_checkpoint(outputs_dir)
+    return (exp_dir, pt) if exp_dir else (None, None)
+
+
+def run_validation_main(cfg=None, model_path_override: str | None = None) -> bool | None:
+    """Hydra entry: cfg is DictConfig with optional experiment_dir; or use model_path_override."""
+    from omegaconf import DictConfig, OmegaConf
+
+    model_dir_arg = model_path_override
+    experiment_dir_cfg = None
+    if cfg is not None and isinstance(cfg, DictConfig):
+        experiment_dir_cfg = OmegaConf.select(cfg, "experiment_dir", default=None)
+        if experiment_dir_cfg in ("null", "", None):
+            experiment_dir_cfg = None
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}\n")
 
-    outputs_dir = Path('outputs')
+    outputs_dir = _get_project_root() / "outputs"
+    exp_dir, model_path = resolve_experiment_paths(model_dir_arg, experiment_dir_cfg, outputs_dir)
 
-    # Resolve experiment directory and model path
-    if model_dir_arg is None:
-        model_dirs = sorted(outputs_dir.glob('jepa_*'))
-        if not model_dirs:
-            print("✗ No trained models found in outputs/")
-            return
-        exp_dir = model_dirs[-1]
-        model_path = exp_dir / 'best_model.pt'
-        print(f"Using model: {model_path}\n")
-    else:
-        p = Path(model_dir_arg)
-        if p.is_file():
-            exp_dir = p.parent
-            model_path = p
-        elif p.is_dir():
-            exp_dir = p
-            model_path = exp_dir / 'best_model.pt'
-        else:
-            # Treat as folder name under outputs/
-            exp_dir = outputs_dir / p
-            model_path = exp_dir / 'best_model.pt'
-        if not exp_dir.exists():
-            print(f"✗ Not found: {exp_dir}")
-            return
-        print(f"Using model: {model_path}\n")
+    if exp_dir is None or model_path is None:
+        print("✗ No trained models found in outputs/ (no best_model.pt).")
+        return None
+
+    if not exp_dir.exists():
+        print(f"✗ Not found: {exp_dir}")
+        return None
+    print(f"Using model: {model_path}\n")
 
     if not model_path.exists():
         print(f"✗ Weights not found: {model_path}")
-        return
+        return None
     config_path = exp_dir / 'config.json'
     if not config_path.exists():
         print(f"✗ Config not found: {config_path}")
@@ -681,6 +732,13 @@ def main(model_path: str = None):
         print("\n⚠ JEPA validation MARGINAL")
         print(f"  (Global test ROC-AUC = {test_auc:.4f}, target > 0.65)")
         return False
+
+
+def main(model_path: str | None = None):
+    """CLI validation: --model-dir or latest checkpoint."""
+    args = parse_args()
+    model_dir_arg = args.model_dir if args.model_dir is not None else model_path
+    return run_validation_main(cfg=None, model_path_override=model_dir_arg)
 
 
 if __name__ == "__main__":

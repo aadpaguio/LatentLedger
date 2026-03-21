@@ -7,7 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional, List
 
-from losses import vicreg_cov_loss, vicreg_var_loss
 from math import pi, cos
 
 # Safe default for positional embedding; sequences longer than this are clamped.
@@ -141,6 +140,10 @@ class Predictor(nn.Module):
         self.mask_token = nn.Parameter(torch.zeros(1, 1, predictor_d_model))
         nn.init.trunc_normal_(self.mask_token, std=0.02)
 
+        if predictor_d_model % nhead != 0:
+            raise ValueError(
+                f"predictor_d_model ({predictor_d_model}) must be divisible by nhead ({nhead})."
+            )
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=predictor_d_model,
             nhead=nhead,
@@ -252,9 +255,13 @@ class JEPA(nn.Module):
         for param in self.target_encoder.parameters():
             param.requires_grad = False
 
-    def get_ema_decay(self, step: int, total_steps: int) -> float:
-        tau_start = 0.90
-        tau_end = 0.999
+    def get_ema_decay(
+        self,
+        step: int,
+        total_steps: int,
+        tau_start: float = 0.90,
+        tau_end: float = 0.999,
+    ) -> float:
         cosine = (1 - cos(pi * step / max(1, total_steps))) / 2
         return tau_start + (tau_end - tau_start) * cosine
 
@@ -357,9 +364,6 @@ class JEPA(nn.Module):
         amount: torch.Tensor,
         time_bucket: Optional[torch.Tensor] = None,
         intra_day_rank: Optional[torch.Tensor] = None,
-        vicreg_cov_weight: float = 0.0,
-        vicreg_var_weight: float = 0.0,
-        vicreg_gamma: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -367,12 +371,9 @@ class JEPA(nn.Module):
             amount: (batch, seq_len, 1) - Transaction amounts
             time_bucket: Optional (batch, seq_len) - days since first transaction
             intra_day_rank: Optional (batch, seq_len) - within-day order
-            vicreg_cov_weight: Weight for VICReg covariance loss on mean-pooled context (0 = off).
-            vicreg_var_weight: Weight for VICReg variance loss on mean-pooled context (0 = off).
-            vicreg_gamma: Target per-dim std for variance loss.
 
         Returns:
-            loss: Scalar loss (mean over M blocks + optional VICReg terms)
+            loss: Scalar loss (mean over M blocks)
             sx: (batch, num_context, d_model) - Context encoder output
         """
         batch_size, seq_len = mcc.shape
@@ -427,13 +428,6 @@ class JEPA(nn.Module):
 
         loss = total_loss / M
 
-        if vicreg_cov_weight > 0 or vicreg_var_weight > 0:
-            z = sx.mean(dim=1)  # (batch, d_model) mean-pooled context
-            if vicreg_cov_weight > 0:
-                loss = loss + vicreg_cov_weight * vicreg_cov_loss(z)
-            if vicreg_var_weight > 0:
-                loss = loss + vicreg_var_weight * vicreg_var_loss(z, gamma=vicreg_gamma)
-
         return loss, sx
 
     def get_embedding(
@@ -449,6 +443,22 @@ class JEPA(nn.Module):
         """
         with torch.no_grad():
             return self.target_encoder(
+                mcc,
+                amount,
+                time_bucket=time_bucket,
+                intra_day_rank=intra_day_rank,
+            )
+
+    def get_online_embedding(
+        self,
+        mcc: torch.Tensor,
+        amount: torch.Tensor,
+        time_bucket: Optional[torch.Tensor] = None,
+        intra_day_rank: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Token-level embeddings from the online (context) encoder (no masking)."""
+        with torch.no_grad():
+            return self.online_encoder(
                 mcc,
                 amount,
                 time_bucket=time_bucket,

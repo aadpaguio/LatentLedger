@@ -14,11 +14,12 @@ Steps (mirroring config/preprocessing/*.yaml):
   5. event_time: dt_to_timestamp (unix seconds) for churn/default/hsbc, none for age
 """
 
+import pickle
 from pathlib import Path
 from typing import Any, Literal
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 
 # Dataset configs matching transactions_gen_models config/preprocessing/*.yaml
@@ -122,6 +123,11 @@ def preprocess_flat_parquet(
     if not path.exists():
         raise FileNotFoundError(f"Parquet not found: {path}")
 
+    cache_path = path.with_name(path.name.replace(".parquet", f".{dataset}_preprocessed.pkl"))
+    if cache_path.exists() and cache_path.stat().st_mtime >= path.stat().st_mtime:
+        with open(cache_path, "rb") as f:
+            return pickle.load(f)
+
     cfg = DATASET_CONFIG.get(dataset)
     if cfg is None:
         cfg = {
@@ -164,13 +170,22 @@ def preprocess_flat_parquet(
     # 5. Group by user_id, sorted — matches ptls UserGroupTransformer which does sort_index()
     #    before groupby, giving records in ascending user_id order.
     df = df.sort_values(["user_id", "timestamp"])
+    ts_dt = pd.to_datetime(df["timestamp"])
+    df["_cal"] = ts_dt.dt.normalize()
+    first_day = df.groupby("user_id", sort=False)["_cal"].transform("first")
+    df["_time_bucket"] = (df["_cal"] - first_day).dt.days.clip(lower=0, upper=1023).astype(np.int64)
+    df["_intra_day_rank"] = (
+        df.groupby(["user_id", "_cal"], sort=False).cumcount().clip(upper=31).astype(np.int64)
+    )
+
     grouped = df.groupby("user_id", sort=False)
 
     records = []
     for user_id, grp in grouped:
         grp = grp.sort_values("timestamp")
         mcc_encoded = [mcc_map.get(int(m), 0) for m in grp["mcc_code"].values]
-        time_bucket, intra_day_rank = compute_temporal_features(grp["timestamp"])
+        time_bucket = grp["_time_bucket"].astype(int).tolist()
+        intra_day_rank = grp["_intra_day_rank"].astype(int).tolist()
         rec = {
             "user_id": user_id,
             "event_time": grp["event_time"].values.tolist(),
@@ -186,6 +201,9 @@ def preprocess_flat_parquet(
             # local_target is e.g. [0,0,...,0,1,1] for a churner (last-month txns = 1).
             rec["local_target"] = grp["local_target"].astype(int).values.tolist()
         records.append(rec)
+
+    with open(cache_path, "wb") as f:
+        pickle.dump(records, f)
 
     return records
 

@@ -4,11 +4,12 @@
 from pathlib import Path
 
 # UPDATE THESE PATHS TO WHERE YOUR PARQUETS ARE!
+_ROOT = Path(__file__).resolve().parent.parent
 PARQUET_PATHS = {
-    'churn': Path('/Users/arnaldpaguio/Documents/Portofolio /LatentLedger/data/age.parquet'),      # ← CHANGE!
-    'default': Path('/Users/arnaldpaguio/Documents/Portofolio /LatentLedger/data/default.parquet'),  # ← CHANGE!
-    'hsbc': Path('/Users/arnaldpaguio/Documents/Portofolio /LatentLedger/data/hsbc.parquet'),        # ← CHANGE!
-    'age': Path('/Users/arnaldpaguio/Documents/Portofolio /LatentLedger/data/age.parquet'),          # ← CHANGE!
+    "churn": _ROOT / "data" / "churn.parquet",
+    "default": _ROOT / "data" / "default.parquet",
+    "hsbc": _ROOT / "data" / "hsbc.parquet",
+    "age": _ROOT / "data" / "age.parquet",
 }
 
 def verify_parquets():

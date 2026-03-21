@@ -1,0 +1,6 @@
+defaults:
+  - config
+  - _self_
+
+# Path to a training run directory (contains config.json + best_model.pt). If null, uses latest outputs/jepa_*.
+experiment_dir: null
