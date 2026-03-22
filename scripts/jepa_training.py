@@ -382,12 +382,24 @@ def run_training(cfg: DictConfig, hydra_output_dir: Path | None = None) -> Path:
 
         diag = compute_collapse_diagnostics(model, val_loader, device, n_batches=3)
         wandb.log(diag, step=steps_completed)
+        dead_dims = diag["diagnostics/dead_dims"]
+        d_model = int(model.d_model)
         print(
             f"  eff_rank={diag['diagnostics/effective_rank']:.1f}  "
             f"cos_sim={diag['diagnostics/encoder_cosine_sim']:.4f}  "
             f"probe_auc={diag['diagnostics/probe_roc_auc']:.3f}  "
-            f"param_l2={diag['diagnostics/param_l2_distance']:.2f}"
+            f"param_l2={diag['diagnostics/param_l2_distance']:.2f}  "
+            f"dead_dims={dead_dims}/{d_model}"
         )
+        if dead_dims > d_model * 0.5:
+            print(
+                f"\nEarly stopping: dead_dims ({dead_dims}) > 0.5 * d_model ({d_model * 0.5:.0f})"
+            )
+            wandb.log(
+                {"train/early_stop_reason": "dead_dims_threshold"},
+                step=steps_completed,
+            )
+            break
 
     wandb.finish()
 

@@ -112,20 +112,28 @@ def compute_collapse_diagnostics(
     cos_sim = F.cosine_similarity(ctx_t, tgt_t, dim=1)  # (N,)
     metrics['diagnostics/encoder_cosine_sim'] = float(cos_sim.mean().item())
 
-    # -- 5. Linear probe (if labels available and both classes present) --
+    # -- 5. Linear probe (if labels available and ≥2 classes present) --
+    # Match global validation in validate_jepa.evaluate_on_test: binary uses proba[:, 1];
+    # multiclass (e.g. Age) uses one-vs-rest with weighted average.
     if labels is not None and len(np.unique(labels)) >= 2:
         N = len(ctx_embs)
         # 80/20 split (deterministic)
         split = int(0.8 * N)
         try:
-            clf = LogisticRegression(max_iter=200, solver='lbfgs')
+            clf = LogisticRegression(max_iter=200, solver="lbfgs")
             clf.fit(ctx_embs[:split], labels[:split])
-            probe_proba = clf.predict_proba(ctx_embs[split:])[:, 1]
-            probe_auc = roc_auc_score(labels[split:], probe_proba)
-            metrics['diagnostics/probe_roc_auc'] = float(probe_auc)
+            probe_proba = clf.predict_proba(ctx_embs[split:])
+            y_eval = labels[split:]
+            if len(clf.classes_) == 2:
+                probe_auc = roc_auc_score(y_eval, probe_proba[:, 1])
+            else:
+                probe_auc = roc_auc_score(
+                    y_eval, probe_proba, multi_class="ovr", average="weighted"
+                )
+            metrics["diagnostics/probe_roc_auc"] = float(probe_auc)
         except Exception:
-            metrics['diagnostics/probe_roc_auc'] = float('nan')
+            metrics["diagnostics/probe_roc_auc"] = float("nan")
     else:
-        metrics['diagnostics/probe_roc_auc'] = float('nan')
+        metrics["diagnostics/probe_roc_auc"] = float("nan")
 
     return metrics
