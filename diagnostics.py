@@ -38,7 +38,8 @@ def compute_collapse_diagnostics(
     Metrics:
       diagnostics/effective_rank      - exp(entropy) of covariance spectrum (target encoder)
       diagnostics/mean_dim_variance   - mean per-dimension variance (target encoder)
-      diagnostics/dead_dims           - dims with variance < 1e-6 (target encoder)
+      diagnostics/dead_dims           - dims with variance < 1e-6 on pooled embeddings (target encoder)
+      diagnostics/token_dead_dims     - dims with variance < 1e-6 on raw token embeddings (before pooling)
       diagnostics/param_l2_distance   - L2 distance between context/target encoder params
       diagnostics/encoder_cosine_sim  - mean cosine sim between context/target mean-pooled embeddings
       diagnostics/probe_roc_auc       - logistic regression on context encoder embeddings vs target label
@@ -48,6 +49,7 @@ def compute_collapse_diagnostics(
     # -- Collect embeddings from both encoders --
     ctx_embs = []
     tgt_embs = []
+    tgt_token_embs = []
     labels = []
 
     with torch.no_grad():
@@ -77,12 +79,16 @@ def compute_collapse_diagnostics(
 
             ctx_embs.append(ctx_pooled.cpu().numpy())
             tgt_embs.append(tgt_pooled.cpu().numpy())
+            # Flatten (B, T, D) -> (B*T, D) to capture per-token variance
+            B, T, D = tgt.shape
+            tgt_token_embs.append(tgt.cpu().numpy().reshape(B * T, D))
 
             if 'target' in batch:
                 labels.append(batch['target'].numpy())
 
-    ctx_embs = np.concatenate(ctx_embs, axis=0)   # (N, D)
-    tgt_embs = np.concatenate(tgt_embs, axis=0)   # (N, D)
+    ctx_embs = np.concatenate(ctx_embs, axis=0)        # (N, D)
+    tgt_embs = np.concatenate(tgt_embs, axis=0)        # (N, D)
+    tgt_token_embs = np.concatenate(tgt_token_embs, axis=0)  # (N*T, D)
     labels = np.concatenate(labels, axis=0) if labels else None
 
     metrics = {}
@@ -92,9 +98,15 @@ def compute_collapse_diagnostics(
     metrics['diagnostics/effective_rank'] = _effective_rank(H)
 
     # -- 2. Variance stats (target encoder) --
-    dim_var = tgt_embs.var(axis=0)  # (D,)
+    dim_var = tgt_embs.var(axis=0)  # (D,) — pooled embeddings
     metrics['diagnostics/mean_dim_variance'] = float(dim_var.mean())
     metrics['diagnostics/dead_dims'] = int((dim_var < 1e-6).sum())
+
+    # Token-level dead dims (before mean pooling): variance across all (sample, position) tokens
+    # If token_dead_dims ≈ 0 but dead_dims is high, sequences are internally homogeneous
+    # (mean pooling cancels diversity). If both are high, the encoder itself is collapsing.
+    token_var = tgt_token_embs.var(axis=0)  # (D,)
+    metrics['diagnostics/token_dead_dims'] = int((token_var < 1e-6).sum())
 
     # -- 3. Parameter L2 distance --
     l2_sq = 0.0

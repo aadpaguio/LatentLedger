@@ -384,12 +384,14 @@ def run_training(cfg: DictConfig, hydra_output_dir: Path | None = None) -> Path:
         wandb.log(diag, step=steps_completed)
         dead_dims = diag["diagnostics/dead_dims"]
         d_model = int(model.d_model)
+        token_dead_dims = diag["diagnostics/token_dead_dims"]
         print(
             f"  eff_rank={diag['diagnostics/effective_rank']:.1f}  "
             f"cos_sim={diag['diagnostics/encoder_cosine_sim']:.4f}  "
             f"probe_auc={diag['diagnostics/probe_roc_auc']:.3f}  "
             f"param_l2={diag['diagnostics/param_l2_distance']:.2f}  "
-            f"dead_dims={dead_dims}/{d_model}"
+            f"dead_dims(pooled)={dead_dims}/{d_model}  "
+            f"dead_dims(token)={token_dead_dims}/{d_model}"
         )
         if dead_dims > d_model * 0.5:
             print(
