@@ -228,11 +228,12 @@ def validate(model, val_loader, device: torch.device, debug: bool = True) -> flo
 
 
 def get_project_root() -> Path:
+    """Hydra cwd when launched with @hydra.main; else repo root (e.g. train_jepa.py)."""
     try:
         import hydra
 
         return Path(hydra.utils.get_original_cwd())
-    except ImportError:
+    except (ImportError, ValueError):
         return Path(__file__).resolve().parent.parent
 
 
