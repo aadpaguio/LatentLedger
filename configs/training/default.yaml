@@ -10,3 +10,5 @@ val_size: 0.1
 test_size: 0.1
 random_state: 42
 num_workers: 0
+vicreg_var_weight: 0.0
+vicreg_cov_weight: 0.0

@@ -7,6 +7,8 @@ Supports the same datasets (churn, default, hsbc, age) and preprocessed parquet 
 We preprocess via preprocessing.preprocess_flat_parquet() and split 80/10/10 (val_size=0.1, test_size=0.1).
 """
 
+import random
+
 import torch
 import numpy as np
 from pathlib import Path
@@ -32,9 +34,11 @@ class TransactionDataset(Dataset):
         self,
         records: List[Dict[str, Any]],
         max_seq_len: int = 256,
+        deterministic: bool = False,
     ):
         self.records = records
         self.max_seq_len = max_seq_len
+        self.deterministic = deterministic
 
     def __len__(self) -> int:
         return len(self.records)
@@ -66,10 +70,19 @@ class TransactionDataset(Dataset):
             time_buckets = time_buckets + [0] * pad_len
             intra_day_ranks = intra_day_ranks + [0] * pad_len
         else:
-            mccs = mccs[: self.max_seq_len]
-            amounts = amounts[: self.max_seq_len]
-            time_buckets = time_buckets[: self.max_seq_len]
-            intra_day_ranks = intra_day_ranks[: self.max_seq_len]
+            if self.deterministic:
+                mccs = mccs[: self.max_seq_len]
+                amounts = amounts[: self.max_seq_len]
+                time_buckets = time_buckets[: self.max_seq_len]
+                intra_day_ranks = intra_day_ranks[: self.max_seq_len]
+            else:
+                max_start = seq_len - self.max_seq_len
+                start = random.randint(0, max_start)
+                end = start + self.max_seq_len
+                mccs = mccs[start:end]
+                amounts = amounts[start:end]
+                time_buckets = time_buckets[start:end]
+                intra_day_ranks = intra_day_ranks[start:end]
             seq_len = self.max_seq_len
 
         out = {
@@ -377,9 +390,9 @@ def get_dataloaders(
     print(f"\nLoaded {parquet_path} (dataset={dataset or 'legacy'})")
     print(f"  Users: train={len(train_rec)}, val={len(val_rec)}, test={len(test_rec)}")
 
-    train_ds = TransactionDataset(train_rec, max_seq_len=max_seq_len)
-    val_ds = TransactionDataset(val_rec, max_seq_len=max_seq_len)
-    test_ds = TransactionDataset(test_rec, max_seq_len=max_seq_len)
+    train_ds = TransactionDataset(train_rec, max_seq_len=max_seq_len, deterministic=False)
+    val_ds = TransactionDataset(val_rec, max_seq_len=max_seq_len, deterministic=True)
+    test_ds = TransactionDataset(test_rec, max_seq_len=max_seq_len, deterministic=True)
 
     train_loader = DataLoader(
         train_ds,

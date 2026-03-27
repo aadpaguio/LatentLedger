@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from data_utils import get_dataloaders
 from diagnostics import compute_collapse_diagnostics
+from losses import vicreg_cov_loss, vicreg_var_loss
 from models.jepa import JEPA
 
 logger = logging.getLogger(__name__)
@@ -130,6 +131,8 @@ def flatten_config_for_json(cfg: DictConfig) -> dict[str, Any]:
         "test_size": tr.get("test_size", 0.1),
         "random_state": tr.get("random_state", 42),
         "num_workers": tr.get("num_workers", 0),
+        "vicreg_var_weight": tr.get("vicreg_var_weight", 0.0),
+        "vicreg_cov_weight": tr.get("vicreg_cov_weight", 0.0),
         "wandb_project": wb.get("project", "latentledger"),
         "wandb_group": wb.get("group", "benchmark_v1"),
     }
@@ -150,6 +153,8 @@ def train_epoch(
     grad_clip_max_norm: float,
     ema_tau_start: float,
     ema_tau_end: float,
+    vicreg_var_weight: float = 0.0,
+    vicreg_cov_weight: float = 0.0,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -162,12 +167,23 @@ def train_epoch(
         time_bucket = batch["time_bucket"].to(device)
         intra_day_rank = batch["intra_day_rank"].to(device)
 
-        loss, _ = model(
+        loss, sx = model(
             mcc,
             amount,
             time_bucket=time_bucket,
             intra_day_rank=intra_day_rank,
         )
+
+        var_loss = torch.tensor(0.0, device=device)
+        cov_loss = torch.tensor(0.0, device=device)
+        if vicreg_var_weight > 0 or vicreg_cov_weight > 0:
+            z = sx.mean(dim=1)
+            if vicreg_var_weight > 0:
+                var_loss = vicreg_var_loss(z)
+                loss = loss + vicreg_var_weight * var_loss
+            if vicreg_cov_weight > 0:
+                cov_loss = vicreg_cov_loss(z)
+                loss = loss + vicreg_cov_weight * cov_loss
 
         optimizer.zero_grad()
         loss.backward()
@@ -180,7 +196,15 @@ def train_epoch(
         )
         model._update_target_encoder(tau=tau)
 
-        wandb.log({"train/step_loss": loss.item(), "train/grad_norm": total_norm}, step=step)
+        wandb.log(
+            {
+                "train/step_loss": loss.item(),
+                "train/grad_norm": total_norm,
+                "train/vicreg_var_loss": var_loss.item(),
+                "train/vicreg_cov_loss": cov_loss.item(),
+            },
+            step=step,
+        )
         total_loss += loss.item()
         num_batches += 1
         pbar.set_postfix({"loss": loss.item()})
@@ -335,6 +359,8 @@ def run_training(cfg: DictConfig, hydra_output_dir: Path | None = None) -> Path:
     ema_start = float(cfg.training.ema_tau_start)
     ema_end = float(cfg.training.ema_tau_end)
     grad_clip = float(cfg.training.grad_clip_max_norm)
+    vicreg_var_w = float(OmegaConf.select(cfg, "training.vicreg_var_weight", default=0.0))
+    vicreg_cov_w = float(OmegaConf.select(cfg, "training.vicreg_cov_weight", default=0.0))
 
     for epoch in range(1, int(cfg.training.epochs) + 1):
         train_loss = train_epoch(
@@ -348,6 +374,8 @@ def run_training(cfg: DictConfig, hydra_output_dir: Path | None = None) -> Path:
             grad_clip,
             ema_start,
             ema_end,
+            vicreg_var_weight=vicreg_var_w,
+            vicreg_cov_weight=vicreg_cov_w,
         )
         steps_completed += len(train_loader)
 
